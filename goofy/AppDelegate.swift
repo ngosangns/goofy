@@ -75,14 +75,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool)
         -> Bool
     {
-        // Reopen window when dock icon clicked
-        if !flag {
-            for window in sender.windows {
-                if window.isMiniaturized {
-                    window.deminiaturize(self)
-                }
-                window.makeKeyAndOrderFront(self)
+        // Reopen window when dock icon clicked. `flag` is unreliable after a
+        // windowShouldClose -> orderOut cycle, so always restore each window.
+        for window in sender.windows {
+            if window.isMiniaturized {
+                window.deminiaturize(self)
             }
+            window.makeKeyAndOrderFront(self)
         }
         return true
     }
