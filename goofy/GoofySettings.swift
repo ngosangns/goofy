@@ -13,6 +13,7 @@ enum GoofySettings {
     enum Key {
         static let notificationMode = "goofy.notificationMode"
         static let hidePreview = "goofy.hidePreview"
+        static let alwaysOnTop = "goofy.alwaysOnTop"
         static let menuBarEnabled = "goofy.menuBarEnabled"
         static let forceReduceMotion = "goofy.forceReduceMotion"
         static let suspendWhenHidden = "goofy.suspendWhenHidden"
@@ -45,7 +46,13 @@ enum GoofySettings {
         set { UserDefaults.standard.set(newValue, forKey: Key.hidePreview) }
     }
 
-    /// Default OFF — status item is pure UX and adds badge-update work on the hot path.
+    /// Default OFF — window floating level when enabled.
+    static var alwaysOnTop: Bool {
+        get { UserDefaults.standard.bool(forKey: Key.alwaysOnTop) }
+        set { UserDefaults.standard.set(newValue, forKey: Key.alwaysOnTop) }
+    }
+
+    /// Default OFF — status item is pure UX; Dock badge is trusted without it.
     static var menuBarEnabled: Bool {
         get {
             if UserDefaults.standard.object(forKey: Key.menuBarEnabled) == nil { return false }

@@ -196,3 +196,28 @@ Goal: drop features that do not help speed; cut CPU/RAM/battery hotspots.
 - Menu bar: **OFF**
 - Force reduce motion: **OFF**
 - Suspend when hidden: **OFF**
+
+---
+
+## Phase warm-ux — speed/UX over idle CPU
+
+**Status: done** (branch `feat/warm-ux`, v4.0.158)
+
+Priority: snappy badge/noti + restored UX; user accepts higher RAM / background CPU vs aggressive idle pause.
+
+| # | Việc | Kết quả |
+|---|------|---------|
+| W.1 | Warm badge/observers | Do **not** pause MutationObservers or skip badge/noti just because `appState === background`. Pause only when native `suspendWhenHidden` → `setSuspended(true)` |
+| W.2 | Native resign/hide | `didResignActive` / `notifyWindowVisibility(false)` only apply pauseMedia + `webView.isHidden` (+ JS suspend) when suspendWhenHidden is ON |
+| W.3 | Foreground debounce | ~250ms (was 400); resume catch-up stays ~200ms |
+| W.4 | Media | `mediaTypesRequiringUserActionForPlayback = .video` (audio/voice OK); AirPlay off |
+| W.5 | Always on Top | UserDefaults + menu/prefs toggle; window `.floating` level |
+| W.6 | Global ⌘⇧Y | Local + global key monitors show/hide window (Accessibility may be required for global) |
+| W.7 | Menu bar | Default still OFF; Dock badge always updated |
+
+### Defaults
+- Menu bar: **OFF**
+- Always on Top: **OFF**
+- Force reduce motion: **OFF**
+- Suspend when hidden: **OFF**
+
