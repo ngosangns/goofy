@@ -3,8 +3,8 @@
 //  goofy
 //
 //  Created by Daniel Büchele on 02/01/2026.
-//  Speed-trim-3: narrow observers; skip badge NC; App Nap timers; LTO;
-//  force reduce-motion + suspend-when-hidden (default off); tracker rules; defer load.
+//  Warm-UX: keep badge/noti warm while backgrounded; Always on Top + ⌘⇧Y restored;
+//  media video-only gate; suspendWhenHidden still opt-in for idle CPU tradeoff.
 //
 
 import AppUpdater
@@ -24,11 +24,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private var updateCheckWorkItem: DispatchWorkItem?
     private var updaterSubscribed = false
+    private var globalHotkeyMonitor: Any?
+    private var localHotkeyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let window = NSApplication.shared.windows.first {
             window.delegate = self
             window.setFrameAutosaveName("MainWindow")
+            applyAlwaysOnTop(GoofySettings.alwaysOnTop, window: window)
         }
 
         // Delay AppUpdater subscription + network check off the launch hot path.
@@ -43,6 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         setupProgrammaticMenus()
         updateStatusItem()
+        registerHotkeys()
 
         NotificationCenter.default.addObserver(
             self,
@@ -54,6 +58,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         updateCheckWorkItem?.cancel()
+        if let globalHotkeyMonitor {
+            NSEvent.removeMonitor(globalHotkeyMonitor)
+        }
+        if let localHotkeyMonitor {
+            NSEvent.removeMonitor(localHotkeyMonitor)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -125,6 +135,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    private func applyAlwaysOnTop(_ enabled: Bool, window: NSWindow? = nil) {
+        let win = window ?? mainWindow()
+        win?.level = enabled ? .floating : .normal
+    }
+
+    // MARK: - Hotkeys ⌘⇧Y (show/hide)
+
+    private func registerHotkeys() {
+        localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak self] event in
+            if self?.isToggleHotkey(event) == true {
+                self?.toggleMainWindow()
+                return nil
+            }
+            return event
+        }
+        globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) {
+            [weak self] event in
+            if self?.isToggleHotkey(event) == true {
+                DispatchQueue.main.async {
+                    self?.toggleMainWindow()
+                }
+            }
+        }
+    }
+
+    private func isToggleHotkey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        return flags == [.command, .shift]
+            && (event.charactersIgnoringModifiers?.lowercased() == "y")
+    }
+
     // MARK: - Status item (opt-in, default off)
 
     private func updateStatusItem() {
@@ -158,6 +200,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func buildStatusMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(withTitle: "Show Goofy", action: #selector(showMainWindow), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        let always = NSMenuItem(
+            title: "Always on Top", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
+        always.state = GoofySettings.alwaysOnTop ? .on : .off
+        always.target = self
+        menu.addItem(always)
         menu.addItem(NSMenuItem.separator())
         let prefs = NSMenuItem(
             title: "Preferences…", action: #selector(showPreferences(_:)), keyEquivalent: ",")
@@ -201,7 +249,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
+        // Window menu: Always on Top
+        if let windowMenuItem = mainMenu.items.first(where: { $0.title == "Window" }),
+            let windowMenu = windowMenuItem.submenu
+        {
+            if windowMenu.item(withTitle: "Always on Top") == nil {
+                let item = NSMenuItem(
+                    title: "Always on Top", action: #selector(toggleAlwaysOnTop(_:)),
+                    keyEquivalent: "")
+                item.target = self
+                item.state = GoofySettings.alwaysOnTop ? .on : .off
+                windowMenu.insertItem(item, at: 0)
+                windowMenu.insertItem(NSMenuItem.separator(), at: 1)
+            }
+        }
+
         let extras = NSMenu(title: "Goofy")
+        let showHide = NSMenuItem(
+            title: "Show/Hide Window", action: #selector(toggleMainWindow), keyEquivalent: "y")
+        showHide.keyEquivalentModifierMask = [.command, .shift]
+        showHide.target = self
+        extras.addItem(showHide)
+        extras.addItem(
+            makeCheckItem("Always on Top", #selector(toggleAlwaysOnTop(_:)), GoofySettings.alwaysOnTop))
         extras.addItem(
             makeCheckItem("Menu Bar Icon", #selector(toggleMenuBar(_:)), GoofySettings.menuBarEnabled))
         extras.addItem(
@@ -285,6 +355,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let menu else { return }
             for item in menu.items {
                 switch item.title {
+                case "Always on Top":
+                    item.state = GoofySettings.alwaysOnTop ? .on : .off
                 case "Menu Bar Icon":
                     item.state = GoofySettings.menuBarEnabled ? .on : .off
                 case "Hide Notification Preview":
@@ -310,6 +382,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: - Actions
+
+    @objc func toggleAlwaysOnTop(_ sender: Any?) {
+        GoofySettings.alwaysOnTop.toggle()
+        applyAlwaysOnTop(GoofySettings.alwaysOnTop)
+        refreshCheckStates()
+    }
 
     @objc func toggleMenuBar(_ sender: Any?) {
         GoofySettings.menuBarEnabled.toggle()
@@ -357,7 +435,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let alert = NSAlert()
         alert.messageText = "Goofy Preferences"
         alert.informativeText =
-            "Notification + speed options. Menu bar, force reduce motion, and suspend-when-hidden default OFF."
+            "Warm UX: badge/noti stay live while backgrounded. Menu bar, force reduce motion, and suspend-when-hidden default OFF. Global ⌘⇧Y toggles the window (may need Accessibility)."
         alert.alertStyle = .informational
 
         let stack = NSStackView()
@@ -387,6 +465,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let toggles: [(String, Bool, Selector)] = [
             ("Hide message preview", GoofySettings.hidePreview, #selector(toggleHidePreview(_:))),
+            ("Always on Top", GoofySettings.alwaysOnTop, #selector(toggleAlwaysOnTop(_:))),
             ("Menu Bar Icon", GoofySettings.menuBarEnabled, #selector(toggleMenuBar(_:))),
             ("Force reduce motion", GoofySettings.forceReduceMotion, #selector(toggleForceReduceMotion(_:))),
             ("Suspend web content when hidden", GoofySettings.suspendWhenHidden, #selector(toggleSuspendWhenHidden(_:))),
@@ -398,7 +477,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stack.addArrangedSubview(button)
         }
 
-        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 200)
+        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 230)
         alert.accessoryView = stack
         alert.addButton(withTitle: "OK")
         alert.runModal()

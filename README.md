@@ -15,13 +15,14 @@ Everything upstream has, plus (this fork) — **speed-first**:
 | Area | Fork additions |
 |------|----------------|
 | Perf | Debounced + narrowed observers; soft-reload + wake health probe; App Nap-friendly timers; optional force reduce-motion / suspend-when-hidden (default off); tracker content rules; Release LTO/strip; deferred first load + delayed updater |
+| Warm UX | Badge/noti observers stay live while backgrounded (unless Suspend When Hidden); Dock badge trusted with menu bar off; video-only media gesture gate (audio/voice OK); Always on Top + global `⌘⇧Y` show/hide |
 | Notifications | Suppress banner when the window is key on the same thread; modes Banner / Badge-only / Off; optional hide message preview |
-| Keyboard | `⌘1`–`⌘9` jump conversations; `⌘[` / `⌘]` previous/next |
-| Window | Optional menu bar status item (**off by default**) |
+| Keyboard | `⌘1`–`⌘9` jump conversations; `⌘[` / `⌘]` previous/next; `⌘⇧Y` show/hide window |
+| Window | Always on Top; optional menu bar status item (**off by default**) |
 | Links | Unwrap `l.facebook.com` tracking redirects |
 | Updates | Auto-updater points at **ngosangns/goofy** (checks ~5 min after launch, or via Check for Updates) |
 
-Removed / not carried (pure UX with CPU/battery cost, little/no speed benefit): Always on Top, Hide Dock, global show/hide hotkey, chat-only CSS mode, block typing/seen inject.
+**Phase warm-ux:** priority speed/UX over idle CPU (user accepts higher RAM). Not carried: Hide Dock, chat-only CSS mode, block typing/seen inject.
 
 ## Installation (this fork)
 

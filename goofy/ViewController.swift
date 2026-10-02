@@ -100,8 +100,9 @@ class ViewController: NSViewController {
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         #endif
 
-        // Avoid autoplay / AirPlay background media work in a chat shell.
-        configuration.mediaTypesRequiringUserActionForPlayback = .all
+        // Prefer video-only gesture gate so chat audio/voice notes can play.
+        // AirPlay stays off to avoid background media work.
+        configuration.mediaTypesRequiringUserActionForPlayback = .video
         configuration.allowsAirPlayForMediaPlayback = false
 
         let userContentController = WKUserContentController()
@@ -548,8 +549,8 @@ class ViewController: NSViewController {
         webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
     }
 
-    /// Pause/resume JS observers when the main window is ordered out/in.
-    /// Optional suspend (default OFF): pause media + hide webView without clearing cookies/session.
+    /// Warm UX: window hide/show never starves badge/noti by itself.
+    /// Only when suspendWhenHidden is ON: pause media + hide webView + pause observers.
     func notifyWindowVisibility(_ visible: Bool) {
         windowVisible = visible
         if visible {
@@ -566,11 +567,17 @@ class ViewController: NSViewController {
         }
     }
 
-    /// Pause videos and hide the web view. Does NOT clear WKWebsiteDataStore / cookies.
+    /// Pause videos, hide web view, and pause JS observers. Does NOT clear cookies/session.
+    /// Only used when GoofySettings.suspendWhenHidden is ON.
     private func suspendWebContent() {
         guard !webContentSuspended, webView != nil else { return }
         webContentSuspended = true
-        let script = "window.__GOOFY && window.__GOOFY.pauseMedia && window.__GOOFY.pauseMedia();"
+        let script = """
+            if (window.__GOOFY) {
+              window.__GOOFY.pauseMedia && window.__GOOFY.pauseMedia();
+              window.__GOOFY.setSuspended && window.__GOOFY.setSuspended(true);
+            }
+            """
         webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
         webView.isHidden = true
     }
@@ -579,6 +586,8 @@ class ViewController: NSViewController {
         guard webContentSuspended, webView != nil else { return }
         webContentSuspended = false
         webView.isHidden = false
+        let script = "window.__GOOFY && window.__GOOFY.setSuspended && window.__GOOFY.setSuspended(false);"
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
     }
 
     func applyForceReduceMotionToPage() {
@@ -701,16 +710,14 @@ class ViewController: NSViewController {
 
     private func updateBadge(count: Int) {
         DispatchQueue.main.async {
+            // Dock badge always — trusted even when menu bar is off.
             if count > 0 {
                 NSApp.dockTile.badgeLabel = "\(count)"
             } else {
                 NSApp.dockTile.badgeLabel = nil
             }
-            // Skip NotificationCenter when menu bar is off — nothing listens.
-            if GoofySettings.menuBarEnabled {
-                NotificationCenter.default.post(
-                    name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
-            }
+            NotificationCenter.default.post(
+                name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
         }
     }
 

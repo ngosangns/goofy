@@ -62,9 +62,9 @@ window.__GOOFY = {
   },
 
   debounceMs: function () {
-    // Longer debounce while backgrounded (observers should already be paused;
-    // this covers residual/resume catch-up).
-    return this.appState === "background" ? 1200 : 400;
+    // Warm UX: keep badge/noti snappy in foreground; slightly longer when
+    // backgrounded (observers stay live unless suspended).
+    return this.appState === "background" ? 800 : 250;
   },
 
   // --- Resilient selectors (aria/role first, class-hash fallback) ---
@@ -209,22 +209,40 @@ window.__GOOFY = {
     return handle;
   },
 
+  // App foreground/background — does NOT pause observers (warm badge/noti).
+  // Observers pause only via setSuspended(true) when native suspendWhenHidden is ON.
   setAppState: function (state) {
     const next = state === "background" ? "background" : "foreground";
     if (this.appState === next) return;
     this.appState = next;
     this.log(`appState -> ${next}`);
 
-    if (next === "background") {
-      this._observersPaused = true;
-      // Clear pending debounces so background catch-up doesn't fire from stale work
+    if (next === "foreground" && !this._observersPaused) {
+      this.debounce(
+        "messages",
+        () => {
+          this.checkForNewMessages();
+          this.updateBadgeCount();
+        },
+        200,
+      );
+    }
+  },
+
+  // Native calls this only when suspendWhenHidden is enabled.
+  setSuspended: function (suspended) {
+    const next = !!suspended;
+    if (this._observersPaused === next) return;
+    this._observersPaused = next;
+    this.log(`suspended -> ${next}`);
+
+    if (next) {
       Object.keys(this._debounceTimers).forEach((k) => {
         clearTimeout(this._debounceTimers[k]);
         delete this._debounceTimers[k];
       });
       this._activeObservers.forEach((o) => o.pause && o.pause());
     } else {
-      this._observersPaused = false;
       this._activeObservers.forEach((o) => o.resume && o.resume());
       this.debounce(
         "messages",
@@ -269,8 +287,7 @@ window.__GOOFY = {
   // --- Badge count ---
 
   updateBadgeCount: function () {
-    if (this.appState === "background") return;
-
+    // Keep counting while backgrounded so Dock badge/noti stay warm.
     const firstTab = document.querySelector('[role="tablist"] [role="tab"]');
     if (firstTab?.getAttribute("aria-selected") !== "true") return;
 
@@ -323,8 +340,7 @@ window.__GOOFY = {
   // --- New message detection ---
 
   checkForNewMessages: function () {
-    if (this.appState === "background") return;
-
+    // Keep scanning while backgrounded so notifications stay warm.
     const links = this.getThreadLinks();
     let firstRun = false;
     if (links.length > 0 && this.threadSnapshots == null) {
@@ -510,13 +526,12 @@ window.__GOOFY = {
       },
     );
 
-    // Pause when the page is hidden (window ordered out / tab-like hide)
+    // Track visibility for debounce timing only — do not pause observers here.
+    // Native suspendWhenHidden drives setSuspended via pauseMedia/hide path.
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         this.setAppState("background");
       } else if (this.appState === "background") {
-        // Native will also send foreground when app becomes active;
-        // only resume here if we were paused solely by visibility.
         this.setAppState("foreground");
       }
     });
