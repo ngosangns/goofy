@@ -129,3 +129,27 @@ Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5
 - CPU nền ≤ vài % khi không có tin mới (sau debounce).
 - Noti: 0 banner khi đang xem đúng thread; badge vẫn đúng.
 - Keyboard jump hoạt động với ≥ 9 thread đầu trong list.
+
+
+---
+
+## Phase 6 — Speed trim (aggressive) ⭐
+
+**Status: done** (branch `feat/speed-trim`)
+
+Goal: drop features that do not help speed; cut CPU/RAM/battery hotspots.
+
+| # | Việc | Kết quả |
+|---|------|---------|
+| 6.1 | Remove Always on Top, Hide Dock, global ⌘⇧Y hotkey | No continuous global event monitor |
+| 6.2 | Menu bar default OFF | Status item not on hot path |
+| 6.3 | Remove chat-only CSS mode + block typing/seen | No fetch hooks / extra CSS class work |
+| 6.4 | Delay AppUpdater 5 min; drop launch noti auth duplicate | Less launch network/CPU |
+| 6.5 | JS: no postToNative logs; skip unchanged badge/currentThread | Less WK bridge IPC |
+| 6.6 | Observer removal watch scoped to parent (not body subtree) | Big MutationObserver CPU win |
+| 6.7 | Soft-reload idle 30 min + 10 min anti-storm; debounce network 3s | Fewer full reloads |
+| 6.8 | Pause observers on window hide + visibilitychange | Idle when closed-to-tray |
+| 6.9 | `developerExtras` / `isInspectable` Debug-only; `drawsBackground=false` | Release leaner |
+| 6.10 | Drop `getComputedStyle` unread heuristic | Avoid forced layout |
+
+**Done when:** Release build installs; core login/webview/badge/links work; idle CPU lower than Phase 4.

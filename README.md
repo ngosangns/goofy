@@ -10,16 +10,18 @@ See **[PLAN.md](./PLAN.md)** for the optimization roadmap and checklist.
 
 ## Features vs upstream
 
-Everything upstream has, plus (this fork):
+Everything upstream has, plus (this fork) — **speed-first**:
 
 | Area | Fork additions |
 |------|----------------|
-| Perf | Debounced badge/message observers; pause work when app is backgrounded; soft-reload on wake/network (skips if you were just typing); dynamic Safari user-agent; system light/dark window chrome |
+| Perf | Debounced badge/message observers; full MutationObserver disconnect when background / window hidden; soft-reload (30 min idle, anti-storm); dynamic Safari UA; system light/dark chrome; Release builds without Web Inspector extras; delayed auto-updater |
 | Notifications | Suppress banner when the window is key on the same thread; modes Banner / Badge-only / Off; optional hide message preview |
 | Keyboard | `⌘1`–`⌘9` jump conversations; `⌘[` / `⌘]` previous/next |
-| Window | Always on Top; menu bar status item with unread count; `⌘⇧Y` show/hide; optional Hide Dock (quit from menu bar) |
-| Focus / privacy | Chat-only CSS mode; unwrap `l.facebook.com` tracking redirects; optional block typing / seen (off by default, experimental) |
-| Updates | Auto-updater points at **ngosangns/goofy** (not upstream), so upstream releases do not overwrite this fork |
+| Window | Optional menu bar status item (**off by default**) |
+| Links | Unwrap `l.facebook.com` tracking redirects |
+| Updates | Auto-updater points at **ngosangns/goofy** (checks ~5 min after launch, or via Check for Updates) |
+
+Removed / not carried (pure UX with CPU/battery cost, little/no speed benefit): Always on Top, Hide Dock, global show/hide hotkey, chat-only CSS mode, block typing/seen inject.
 
 ## Installation (this fork)
 
@@ -50,8 +52,5 @@ No — native macOS WebKit via Swift. Smaller and lighter than Electron wrappers
 ### Can Goofy access my Facebook data?
 It injects a small script for notifications and badge counting. Source is open; no telemetry is collected. Settings live in `UserDefaults` under `goofy.*` keys.
 
-### Hide Dock icon
-Enable **Goofy → Hide Dock Icon** (also turns on the menu bar icon if needed). Quit from the status menu or **Quit Goofy**.
-
-### Block typing / seen
-Optional and brittle (Facebook DOM/API changes often). Default **off**. Use at your own risk.
+### Menu bar icon
+Off by default. Enable via **Goofy → Menu Bar Icon** or Preferences.
