@@ -14,6 +14,8 @@ enum GoofySettings {
         static let notificationMode = "goofy.notificationMode"
         static let hidePreview = "goofy.hidePreview"
         static let menuBarEnabled = "goofy.menuBarEnabled"
+        static let forceReduceMotion = "goofy.forceReduceMotion"
+        static let suspendWhenHidden = "goofy.suspendWhenHidden"
     }
 
     enum NotificationMode: String, CaseIterable {
@@ -50,5 +52,23 @@ enum GoofySettings {
             return UserDefaults.standard.bool(forKey: Key.menuBarEnabled)
         }
         set { UserDefaults.standard.set(newValue, forKey: Key.menuBarEnabled) }
+    }
+
+    /// Default OFF — safer; when ON, inject CSS that kills animations regardless of system preference.
+    static var forceReduceMotion: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: Key.forceReduceMotion) == nil { return false }
+            return UserDefaults.standard.bool(forKey: Key.forceReduceMotion)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Key.forceReduceMotion) }
+    }
+
+    /// Default OFF (opt-in). When ON and window is hidden: pause videos / hide webView without clearing cookies.
+    static var suspendWhenHidden: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: Key.suspendWhenHidden) == nil { return false }
+            return UserDefaults.standard.bool(forKey: Key.suspendWhenHidden)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Key.suspendWhenHidden) }
     }
 }

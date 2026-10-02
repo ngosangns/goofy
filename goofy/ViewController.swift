@@ -50,6 +50,9 @@ class ViewController: NSViewController {
     private var networkReloadWorkItem: DispatchWorkItem?
     private var windowVisible = true
     private var interactionMonitor: Any?
+    private var didLoadMessenger = false
+    private var webContentSuspended = false
+    private var contentRulesInstalled = false
 
     // MARK: - Lifecycle
 
@@ -59,7 +62,7 @@ class ViewController: NSViewController {
         setupNotifications()
         setupAppearanceObserver()
         setupInteractionTracking()
-        loadMessenger()
+        // Defer first loadMessenger to viewDidAppear so window/chrome settle first.
     }
 
     override func viewDidAppear() {
@@ -68,6 +71,11 @@ class ViewController: NSViewController {
             configureWindow()
             setupPeriodicReload()
             windowConfigured = true
+        }
+        if !didLoadMessenger {
+            didLoadMessenger = true
+            applyForceReduceMotionToPage()
+            loadMessenger()
         }
     }
 
@@ -124,6 +132,17 @@ class ViewController: NSViewController {
             userContentController.addUserScript(cssScript)
         }
 
+        // Bootstrap force-reduce-motion class early when the setting is on.
+        if GoofySettings.forceReduceMotion {
+            let reduceScript = WKUserScript(
+                source: "document.documentElement.classList.add('goofy-force-reduce-motion');",
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true,
+                in: .page
+            )
+            userContentController.addUserScript(reduceScript)
+        }
+
         // Inject content.js at document end
         if let scriptURL = Bundle.main.url(forResource: "content", withExtension: "js"),
             let scriptContent = try? String(contentsOf: scriptURL, encoding: .utf8)
@@ -138,6 +157,7 @@ class ViewController: NSViewController {
         }
 
         configuration.userContentController = userContentController
+        installContentRuleList(into: userContentController)
 
         // Create WebView
         webView = GoofyWebView(frame: view.bounds, configuration: configuration)
@@ -247,25 +267,81 @@ class ViewController: NSViewController {
 
     // MARK: - Interaction tracking
 
+    /// App Nap friendly: do not keep a permanent local event monitor.
+    /// Attach only while a soft-reload is pending or near the idle window.
     private func setupInteractionTracking() {
-        interactionMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.keyDown, .leftMouseDown, .rightMouseDown]
-        ) { [weak self] event in
-            self?.lastUserInteraction = Date()
-            return event
-        }
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(applicationDidBecomeActive),
             name: NSApplication.didBecomeActiveNotification,
             object: nil
         )
+        lastUserInteraction = Date()
+    }
+
+    private func noteUserInteraction() {
+        lastUserInteraction = Date()
+        if !reloadPending {
+            detachInteractionMonitor()
+        }
+    }
+
+    private func ensureInteractionMonitorAttached() {
+        guard interactionMonitor == nil else { return }
+        interactionMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            self?.noteUserInteraction()
+            return event
+        }
+    }
+
+    private func detachInteractionMonitor() {
+        if let interactionMonitor {
+            NSEvent.removeMonitor(interactionMonitor)
+            self.interactionMonitor = nil
+        }
+    }
+
+    private func markReloadPending() {
+        reloadPending = true
+        ensureInteractionMonitorAttached()
     }
 
     private func loadMessenger() {
         guard let url = URL(string: "https://www.facebook.com/messages/") else { return }
         let request = URLRequest(url: url)
         webView.load(request)
+    }
+
+    // MARK: - Content blocker (trackers only; never fbcdn/fbsbx media)
+
+    /// Blocks pixel/tr trackers. Media hosts (`fbcdn.net`, `fbsbx.com`) are intentionally not matched.
+    private func installContentRuleList(into controller: WKUserContentController) {
+        guard !contentRulesInstalled else { return }
+        let json = """
+        [
+          {"trigger":{"url-filter":"^https?://pixel\\.facebook\\.com"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://([a-z0-9-]+\\.)?facebook\\.com/tr(/|\\?|$)"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://connect\\.facebook\\.net/.*/fbevents"},"action":{"type":"block"}},
+          {"trigger":{"url-filter":"^https?://www\\.facebook\\.com/tr(/|\\?|$)"},"action":{"type":"block"}}
+        ]
+        """
+        WKContentRuleListStore.default().compileContentRuleList(
+            forIdentifier: "GoofyTrackerBlock",
+            encodedContentRuleList: json
+        ) { [weak self] list, error in
+            #if DEBUG
+            if let error {
+                print("Content rule compile failed: \(error)")
+            }
+            #endif
+            guard let list else { return }
+            DispatchQueue.main.async {
+                controller.add(list)
+                self?.contentRulesInstalled = true
+            }
+        }
     }
 
     // MARK: - Periodic Reload
@@ -287,13 +363,14 @@ class ViewController: NSViewController {
             object: NSWorkspace.shared
         )
 
-        // Timer that fires every 4 hours
+        // Timer every 3 hours — large tolerance helps App Nap coalesce wakes.
         reloadTimer = Timer.scheduledTimer(
             withTimeInterval: reloadInterval,
             repeats: true
         ) { [weak self] _ in
             self?.timerFired()
         }
+        reloadTimer?.tolerance = min(15 * 60, reloadInterval * 0.1)
 
         // Network connectivity monitor
         setupNetworkMonitor()
@@ -312,7 +389,7 @@ class ViewController: NSViewController {
 
     private func timerFired() {
         if NSApplication.shared.isActive {
-            reloadPending = true
+            markReloadPending()
             #if DEBUG
             print("Reload deferred - app is in foreground")
             #endif
@@ -322,12 +399,23 @@ class ViewController: NSViewController {
     }
 
     @objc private func systemDidWake(_ notification: Notification) {
-        // Skip wake storm when session looks healthy and user was recently active.
+        // Skip wake storm when session looks healthy and user was recently active —
+        // but only after a deeper readyState / navigation probe.
         let idle = Date().timeIntervalSince(lastUserInteraction)
-        if isAuthenticated, idle < softReloadIdleSeconds, !isPageLikelyBroken() {
-            #if DEBUG
-            print("System wake - soft reload skipped (authenticated, idle \(Int(idle))s)")
-            #endif
+        if isAuthenticated, idle < softReloadIdleSeconds {
+            probePageHealth { [weak self] broken in
+                guard let self else { return }
+                if broken || self.isPageLikelyBrokenSync() {
+                    #if DEBUG
+                    print("System wake - page looks broken, soft reload")
+                    #endif
+                    self.softReload(reason: "wake-broken")
+                } else {
+                    #if DEBUG
+                    print("System wake - soft reload skipped (authenticated, idle \(Int(idle))s, healthy)")
+                    #endif
+                }
+            }
             return
         }
         #if DEBUG
@@ -364,18 +452,18 @@ class ViewController: NSViewController {
             #if DEBUG
             print("Soft reload skipped (\(reason)): user recently active while key")
             #endif
-            reloadPending = true
+            markReloadPending()
             return
         }
 
         // Avoid reload storms: at most once per 10 minutes unless page looks broken.
         let sinceLast = Date().timeIntervalSince(lastReloadDate)
-        let pageBroken = isPageLikelyBroken()
+        let pageBroken = isPageLikelyBrokenSync()
         if !pageBroken && sinceLast < 10 * 60 {
             #if DEBUG
             print("Soft reload skipped (\(reason)): reloaded \(Int(sinceLast))s ago")
             #endif
-            reloadPending = true
+            markReloadPending()
             return
         }
 
@@ -389,12 +477,12 @@ class ViewController: NSViewController {
                 "Soft reload deferred (\(reason)): idle \(Int(idle))s < \(Int(softReloadIdleSeconds))s"
             )
             #endif
-            reloadPending = true
+            markReloadPending()
         }
     }
 
-    private func isPageLikelyBroken() -> Bool {
-        // Heuristic: blank URL or not on facebook messages
+    /// Sync URL-host heuristic (cheap).
+    private func isPageLikelyBrokenSync() -> Bool {
         guard let url = webView.url else { return true }
         let host = url.host ?? ""
         if !host.contains("facebook.com") && !host.contains("messenger.com") {
@@ -403,8 +491,31 @@ class ViewController: NSViewController {
         return false
     }
 
+    /// Deeper probe: readyState + [role=navigation] via JS (async).
+    private func probePageHealth(completion: @escaping (Bool) -> Void) {
+        if isPageLikelyBrokenSync() {
+            completion(true)
+            return
+        }
+        guard webView != nil else {
+            completion(true)
+            return
+        }
+        let script =
+            "window.__GOOFY && window.__GOOFY.isPageLikelyBroken ? window.__GOOFY.isPageLikelyBroken() : (document.readyState === 'loading' || !document.querySelector('[role=\"navigation\"]'));"
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { result in
+            switch result {
+            case .success(let value):
+                completion((value as? Bool) ?? false)
+            case .failure:
+                completion(false)
+            }
+        }
+    }
+
     private func performReload(reason: String = "manual") {
         reloadPending = false
+        detachInteractionMonitor()
         lastReloadDate = Date()
         webView.reload()
         #if DEBUG
@@ -414,12 +525,18 @@ class ViewController: NSViewController {
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
         notifyAppState("background")
+        // Near soft-reload idle window — attach monitor so return-to-app updates idle clock.
+        let idle = Date().timeIntervalSince(lastUserInteraction)
+        if reloadPending || idle >= softReloadIdleSeconds - 5 * 60 {
+            ensureInteractionMonitorAttached()
+        }
         if reloadPending {
             softReload(reason: "resign-pending")
         }
     }
 
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        noteUserInteraction()
         if windowVisible {
             notifyAppState("foreground")
         }
@@ -432,15 +549,48 @@ class ViewController: NSViewController {
     }
 
     /// Pause/resume JS observers when the main window is ordered out/in.
+    /// Optional suspend (default OFF): pause media + hide webView without clearing cookies/session.
     func notifyWindowVisibility(_ visible: Bool) {
         windowVisible = visible
         if visible {
+            restoreWebContentIfNeeded()
+            noteUserInteraction()
             if NSApp.isActive {
                 notifyAppState("foreground")
             }
         } else {
             notifyAppState("background")
+            if GoofySettings.suspendWhenHidden {
+                suspendWebContent()
+            }
         }
+    }
+
+    /// Pause videos and hide the web view. Does NOT clear WKWebsiteDataStore / cookies.
+    private func suspendWebContent() {
+        guard !webContentSuspended, webView != nil else { return }
+        webContentSuspended = true
+        let script = "window.__GOOFY && window.__GOOFY.pauseMedia && window.__GOOFY.pauseMedia();"
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
+        webView.isHidden = true
+    }
+
+    private func restoreWebContentIfNeeded() {
+        guard webContentSuspended, webView != nil else { return }
+        webContentSuspended = false
+        webView.isHidden = false
+    }
+
+    func applyForceReduceMotionToPage() {
+        guard webView != nil else { return }
+        let enabled = GoofySettings.forceReduceMotion
+        let script =
+            "window.__GOOFY && window.__GOOFY.setForceReduceMotion && window.__GOOFY.setForceReduceMotion(\(enabled ? "true" : "false"));"
+        webView.evaluateJavaScript(script, in: nil, in: .page) { _ in }
+        // Also toggle class directly in case __GOOFY is not ready yet.
+        let cls =
+            "document.documentElement.classList.toggle('goofy-force-reduce-motion', \(enabled ? "true" : "false"));"
+        webView.evaluateJavaScript(cls, in: nil, in: .page) { _ in }
     }
 
     // MARK: - Window Actions (forwarded to window)
@@ -556,8 +706,11 @@ class ViewController: NSViewController {
             } else {
                 NSApp.dockTile.badgeLabel = nil
             }
-            NotificationCenter.default.post(
-                name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
+            // Skip NotificationCenter when menu bar is off — nothing listens.
+            if GoofySettings.menuBarEnabled {
+                NotificationCenter.default.post(
+                    name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
+            }
         }
     }
 

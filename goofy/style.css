@@ -35,3 +35,13 @@ h1.html-h1 {
         scroll-behavior: auto !important;
     }
 }
+
+/* Force reduce motion (Goofy setting) — independent of system preference. */
+html.goofy-force-reduce-motion *,
+html.goofy-force-reduce-motion *::before,
+html.goofy-force-reduce-motion *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+}

@@ -131,6 +131,8 @@ window.__GOOFY = {
       subtree = true,
       childList = true,
       characterData = false,
+      attributes = false,
+      attributeFilter = undefined,
       retryInterval = 8000,
       onSetup = null,
       onRemove = null,
@@ -178,7 +180,11 @@ window.__GOOFY = {
       contentObserver = new MutationObserver(() => {
         if (!self._observersPaused) callback(element);
       });
-      contentObserver.observe(element, { subtree, childList, characterData });
+      const obsOpts = { subtree, childList, characterData, attributes };
+      if (attributes && attributeFilter && attributeFilter.length) {
+        obsOpts.attributeFilter = attributeFilter;
+      }
+      contentObserver.observe(element, obsOpts);
 
       // Scope removal watch to the parent only — never document.body subtree
       // (that was a major CPU hotspot on Messenger's busy DOM).
@@ -228,6 +234,35 @@ window.__GOOFY = {
         },
         200,
       );
+    }
+  },
+
+  setForceReduceMotion: function (enabled) {
+    try {
+      document.documentElement.classList.toggle("goofy-force-reduce-motion", !!enabled);
+    } catch (_) {}
+  },
+
+  // Pause in-page media without touching storage/cookies (used when suspend-when-hidden is on).
+  pauseMedia: function () {
+    try {
+      document.querySelectorAll("video, audio").forEach((el) => {
+        try {
+          el.pause();
+        } catch (_) {}
+      });
+    } catch (_) {}
+  },
+
+  // Used by native soft-reload health probe.
+  isPageLikelyBroken: function () {
+    try {
+      if (!document.body || document.body.childElementCount === 0) return true;
+      if (document.readyState === "loading") return true;
+      if (!document.querySelector('[role="navigation"]')) return true;
+      return false;
+    } catch (_) {
+      return true;
     }
   },
 
@@ -424,29 +459,54 @@ window.__GOOFY = {
     }
   },
 
+  scheduleMessageCheck: function () {
+    this.debounce(
+      "messages",
+      () => {
+        this.checkForNewMessages();
+        this.updateBadgeCount();
+      },
+      this.debounceMs(),
+    );
+  },
+
   // --- Init ---
 
   init: function () {
     this.log("Initializing Goofy");
 
+    const gridSelector = '[role="navigation"] [role="grid"]';
+    const onRemove = () => {
+      this.threadSnapshots = null;
+      this._lastBadgeCount = -1;
+    };
+
+    // Narrow MutationObserver vs prior whole-grid subtree childList storm:
+    // 1) Structural: direct children of the grid only (row add/remove/reorder).
+    // 2) Status: deep attributeFilter on unread/selection aria — no childList.
     this.observe(
-      '[role="navigation"] [role="grid"]',
-      () => {
-        this.debounce(
-          "messages",
-          () => {
-            this.checkForNewMessages();
-            this.updateBadgeCount();
-          },
-          this.debounceMs(),
-        );
-      },
+      gridSelector,
+      () => this.scheduleMessageCheck(),
       {
+        subtree: false,
+        childList: true,
+        attributes: false,
+        characterData: false,
         onSetup: () => this.updateBadgeCount(),
-        onRemove: () => {
-          this.threadSnapshots = null;
-          this._lastBadgeCount = -1;
-        },
+        onRemove,
+      },
+    );
+
+    this.observe(
+      gridSelector,
+      () => this.scheduleMessageCheck(),
+      {
+        subtree: true,
+        childList: false,
+        attributes: true,
+        attributeFilter: ["aria-label", "aria-selected", "aria-current", "class"],
+        characterData: false,
+        onRemove,
       },
     );
 

@@ -176,3 +176,23 @@ Goal: drop features that do not help speed; cut CPU/RAM/battery hotspots.
 ### Measure
 - Instruments Time Profiler + Allocations on idle 5 min; Activity Monitor CPU/Energy while scrolled + backgrounded
 
+## Speed-trim-3 (post PR #4)
+
+**Status: done** (branch `feat/speed-trim-3`)
+
+| # | Việc | Kết quả |
+|---|------|---------|
+| 7.1 | Narrow MutationObserver | Grid: childList without deep subtree + attributeFilter on aria/class for unread |
+| 7.2 | Skip badge NotificationCenter | `updateBadge` posts `.goofyBadgeDidChange` only if menu bar enabled |
+| 7.3 | App Nap timers | 3h reload `timer.tolerance`; interaction monitor only while `reloadPending` |
+| 7.4 | Release LTO/strip | `LLVM_LTO=YES`, `COPY_PHASE_STRIP=YES`, `DEPLOYMENT_POSTPROCESSING=YES`, `SWIFT_OPTIMIZATION_LEVEL=-O` |
+| 7.5 | Force reduce motion | Setting + menu (default **OFF**); CSS class kills animations regardless of system pref |
+| 7.6 | Curated WKContentRuleList | Block `pixel.facebook.com`, `facebook.com/tr`, `fbevents`; do **not** block fbcdn/fbsbx |
+| 7.7 | Suspend when hidden | Opt-in (default **OFF**): pause media + `webView.isHidden`; cookies/session kept |
+| 7.8 | Defer first `loadMessenger` | Moved to `viewDidAppear` |
+| 7.9 | Deeper `isPageLikelyBroken` | Wake skip runs readyState / `[role=navigation]` JS probe first |
+
+### Defaults (risky flags)
+- Menu bar: **OFF**
+- Force reduce motion: **OFF**
+- Suspend when hidden: **OFF**
