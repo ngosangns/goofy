@@ -17,16 +17,18 @@ Mục tiêu: giữ shell WKWebView nhẹ, thêm tối ưu pin/UX/privacy theo t�
 
 ## Phase 0 — Nền tảng fork (½ ngày)
 
-- [ ] Đổi display name / bundle id nếu muốn tách app khỏi upstream (vd. `vn.sang.goofy` hoặc giữ Goofy khi dev).
-- [ ] README fork: ghi rõ khác gì upstream + link PLAN.
-- [ ] Xcode scheme chạy Debug ổn; script build/notarize giữ nguyên hoặc document.
-- [ ] Branch strategy: `main` = ổn định; feature branches `feat/...`.
+- [x] Đổi display name / bundle id nếu muốn tách app khỏi upstream (vd. `vn.sang.goofy` hoặc giữ Goofy khi dev). → **Kept** `Goofy` / `cc.buechele.Goofy`.
+- [x] README fork: ghi rõ khác gì upstream + link PLAN.
+- [x] Xcode scheme chạy Debug ổn; script build/notarize giữ nguyên hoặc document.
+- [x] Branch strategy: `main` = ổn định; feature branches `feat/...` (this work on `feat/optimizations`).
 
 **Done when:** mở Xcode → Run → login Messenger bình thường.
 
 ---
 
 ## Phase 1 — Hiệu năng / pin (1–2 ngày) ⭐ làm trước
+
+**Status: done** (on `feat/optimizations`)
 
 Branch: `feat/perf-throttle`
 
@@ -45,6 +47,8 @@ Branch: `feat/perf-throttle`
 
 ## Phase 2 — Noti thông minh + keyboard (2–3 ngày)
 
+**Status: done** (mute-from-noti skipped as nice-to-have)
+
 Branch: `feat/noti-keyboard`
 
 | # | Việc | File chính |
@@ -61,6 +65,8 @@ Branch: `feat/noti-keyboard`
 
 ## Phase 3 — Menu bar + tray UX (2 ngày)
 
+**Status: done**
+
 Branch: `feat/menu-bar`
 
 | # | Việc |
@@ -75,6 +81,8 @@ Branch: `feat/menu-bar`
 ---
 
 ## Phase 4 — Chat-only + privacy (2–3 ngày)
+
+**Status: done**
 
 Branch: `feat/focus-privacy`
 
