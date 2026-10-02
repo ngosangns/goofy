@@ -3,8 +3,8 @@
 //  goofy
 //
 //  Created by Daniel Büchele on 02/01/2026.
-//  Speed-trim-2: AppUpdater fully deferred; media prefs; auth cookie cache;
-//  reduced-motion CSS; cheaper JS notify path. Menu bar opt-in (default off).
+//  Speed-trim-3: narrow observers; skip badge NC; App Nap timers; LTO;
+//  force reduce-motion + suspend-when-hidden (default off); tracker rules; defer load.
 //
 
 import AppUpdater
@@ -208,6 +208,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             makeCheckItem(
                 "Hide Notification Preview", #selector(toggleHidePreview(_:)),
                 GoofySettings.hidePreview))
+        extras.addItem(
+            makeCheckItem(
+                "Force Reduce Motion", #selector(toggleForceReduceMotion(_:)),
+                GoofySettings.forceReduceMotion))
+        extras.addItem(
+            makeCheckItem(
+                "Suspend When Hidden", #selector(toggleSuspendWhenHidden(_:)),
+                GoofySettings.suspendWhenHidden))
         extras.addItem(NSMenuItem.separator())
 
         let notiMenu = NSMenu(title: "Notifications")
@@ -281,6 +289,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     item.state = GoofySettings.menuBarEnabled ? .on : .off
                 case "Hide Notification Preview":
                     item.state = GoofySettings.hidePreview ? .on : .off
+                case "Force Reduce Motion":
+                    item.state = GoofySettings.forceReduceMotion ? .on : .off
+                case "Suspend When Hidden":
+                    item.state = GoofySettings.suspendWhenHidden ? .on : .off
                 case "Banner", "Badge only", "Off":
                     if let raw = item.representedObject as? String {
                         item.state = GoofySettings.notificationMode.rawValue == raw ? .on : .off
@@ -310,6 +322,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshCheckStates()
     }
 
+    @objc func toggleForceReduceMotion(_ sender: Any?) {
+        GoofySettings.forceReduceMotion.toggle()
+        viewController()?.applyForceReduceMotionToPage()
+        refreshCheckStates()
+    }
+
+    @objc func toggleSuspendWhenHidden(_ sender: Any?) {
+        GoofySettings.suspendWhenHidden.toggle()
+        refreshCheckStates()
+    }
+
     @objc func setNotificationMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
             let mode = GoofySettings.NotificationMode(rawValue: raw)
@@ -334,7 +357,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let alert = NSAlert()
         alert.messageText = "Goofy Preferences"
         alert.informativeText =
-            "Notification options. Menu bar icon is off by default to save idle work."
+            "Notification + speed options. Menu bar, force reduce motion, and suspend-when-hidden default OFF."
         alert.alertStyle = .informational
 
         let stack = NSStackView()
@@ -365,6 +388,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let toggles: [(String, Bool, Selector)] = [
             ("Hide message preview", GoofySettings.hidePreview, #selector(toggleHidePreview(_:))),
             ("Menu Bar Icon", GoofySettings.menuBarEnabled, #selector(toggleMenuBar(_:))),
+            ("Force reduce motion", GoofySettings.forceReduceMotion, #selector(toggleForceReduceMotion(_:))),
+            ("Suspend web content when hidden", GoofySettings.suspendWhenHidden, #selector(toggleSuspendWhenHidden(_:))),
         ]
 
         for (title, on, action) in toggles {
@@ -373,7 +398,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stack.addArrangedSubview(button)
         }
 
-        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 140)
+        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 200)
         alert.accessoryView = stack
         alert.addButton(withTitle: "OK")
         alert.runModal()

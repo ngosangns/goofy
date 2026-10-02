@@ -14,7 +14,7 @@ Everything upstream has, plus (this fork) — **speed-first**:
 
 | Area | Fork additions |
 |------|----------------|
-| Perf | Debounced badge/message observers; full MutationObserver disconnect when background / window hidden; soft-reload (30 min idle, anti-storm); dynamic Safari UA; system light/dark chrome; Release builds without Web Inspector extras; delayed auto-updater |
+| Perf | Debounced + narrowed observers; soft-reload + wake health probe; App Nap-friendly timers; optional force reduce-motion / suspend-when-hidden (default off); tracker content rules; Release LTO/strip; deferred first load + delayed updater |
 | Notifications | Suppress banner when the window is key on the same thread; modes Banner / Badge-only / Off; optional hide message preview |
 | Keyboard | `⌘1`–`⌘9` jump conversations; `⌘[` / `⌘]` previous/next |
 | Window | Optional menu bar status item (**off by default**) |
