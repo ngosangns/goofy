@@ -43,7 +43,7 @@ class ViewController: NSViewController {
     // Soft-reload / interaction tracking
     private var lastUserInteraction = Date()
     private var lastReloadDate = Date.distantPast
-    private let softReloadIdleSeconds: TimeInterval = 30 * 60
+    private let softReloadIdleSeconds: TimeInterval = 45 * 60
     private let recentTypingSeconds: TimeInterval = 2 * 60
     private var appearanceObserver: NSKeyValueObservation?
     private var currentThreadKey: String?
@@ -53,16 +53,28 @@ class ViewController: NSViewController {
     private var didLoadMessenger = false
     private var webContentSuspended = false
     private var contentRulesInstalled = false
+    private var lastAppliedBadgeCount = -1
+    private var pendingBadgeCount: Int?
+    private var badgeApplyWorkItem: DispatchWorkItem?
+    private static var didConfigureSharedCaches = false
+    private static let sharedProcessPool = WKProcessPool()
 
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        Self.configureSharedWebCaches()
         setupWebView()
         setupNotifications()
         setupAppearanceObserver()
         setupInteractionTracking()
-        // Defer first loadMessenger to viewDidAppear so window/chrome settle first.
+        // Start Messenger ASAP — window chrome settles in viewDidAppear in parallel.
+        // Deferring to viewDidAppear delayed first paint with no real win once webView exists.
+        if !didLoadMessenger {
+            didLoadMessenger = true
+            applyForceReduceMotionToPage()
+            loadMessenger()
+        }
     }
 
     override func viewDidAppear() {
@@ -72,17 +84,13 @@ class ViewController: NSViewController {
             setupPeriodicReload()
             windowConfigured = true
         }
-        if !didLoadMessenger {
-            didLoadMessenger = true
-            applyForceReduceMotionToPage()
-            loadMessenger()
-        }
     }
 
     deinit {
         reloadTimer?.invalidate()
         networkMonitor?.cancel()
         networkReloadWorkItem?.cancel()
+        badgeApplyWorkItem?.cancel()
         appearanceObserver?.invalidate()
         if let interactionMonitor {
             NSEvent.removeMonitor(interactionMonitor)
@@ -94,11 +102,47 @@ class ViewController: NSViewController {
 
     // MARK: - WebView Setup
 
+    /// Large shared HTTP disk+memory cache + default persistent website data store.
+    /// WebKit also keeps its own network cache; bumping URLCache.shared still helps
+    /// URLSession paths and some shared resource loads. User accepts high RAM.
+    private static func configureSharedWebCaches() {
+        guard !didConfigureSharedCaches else { return }
+        didConfigureSharedCaches = true
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        let diskURL = caches?.appendingPathComponent("GoofyURLCache", isDirectory: true)
+        let cache: URLCache
+        if let diskURL {
+            cache = URLCache(
+                memoryCapacity: GoofySettings.urlCacheMemoryCapacity,
+                diskCapacity: GoofySettings.urlCacheDiskCapacity,
+                directory: diskURL
+            )
+        } else {
+            cache = URLCache(
+                memoryCapacity: GoofySettings.urlCacheMemoryCapacity,
+                diskCapacity: GoofySettings.urlCacheDiskCapacity
+            )
+        }
+        URLCache.shared = cache
+        #if DEBUG
+        print(
+            "Goofy URLCache memory=\(GoofySettings.urlCacheMemoryCapacity / 1024 / 1024)MB disk=\(GoofySettings.urlCacheDiskCapacity / 1024 / 1024)MB"
+        )
+        #endif
+    }
+
     private func setupWebView() {
         let configuration = WKWebViewConfiguration()
+        // Persistent store — never swap to nonPersistent; logout is the only clear path.
+        configuration.websiteDataStore = .default()
+        // Shared pool keeps WebKit process affinity warm across config recreates.
+        configuration.processPool = Self.sharedProcessPool
         #if DEBUG
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         #endif
+        // Incremental rendering on — smoother first paint / thread switch paints.
+        configuration.suppressesIncrementalRendering = false
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
 
         // Prefer video-only gesture gate so chat audio/voice notes can play.
         // AirPlay stays off to avoid background media work.
@@ -311,7 +355,13 @@ class ViewController: NSViewController {
 
     private func loadMessenger() {
         guard let url = URL(string: "https://www.facebook.com/messages/") else { return }
-        let request = URLRequest(url: url)
+        // Prefer cached shell when warm — soft-reload / broken probe still revalidates.
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .returnCacheDataElseLoad,
+            timeoutInterval: 60
+        )
+        request.networkServiceType = .responsiveData
         webView.load(request)
     }
 
@@ -400,10 +450,9 @@ class ViewController: NSViewController {
     }
 
     @objc private func systemDidWake(_ notification: Notification) {
-        // Skip wake storm when session looks healthy and user was recently active —
-        // but only after a deeper readyState / navigation probe.
-        let idle = Date().timeIntervalSince(lastUserInteraction)
-        if isAuthenticated, idle < softReloadIdleSeconds {
+        // Force-cache friendly: never reload on wake when session looks healthy.
+        // Probe readyState / navigation; only soft-reload if broken.
+        if isAuthenticated {
             probePageHealth { [weak self] broken in
                 guard let self else { return }
                 if broken || self.isPageLikelyBrokenSync() {
@@ -413,7 +462,7 @@ class ViewController: NSViewController {
                     self.softReload(reason: "wake-broken")
                 } else {
                     #if DEBUG
-                    print("System wake - soft reload skipped (authenticated, idle \(Int(idle))s, healthy)")
+                    print("System wake - soft reload skipped (authenticated, healthy / cache warm)")
                     #endif
                 }
             }
@@ -431,10 +480,27 @@ class ViewController: NSViewController {
             // Debounce NWPathMonitor chatter (flaps on sleep/VPN).
             networkReloadWorkItem?.cancel()
             let work = DispatchWorkItem { [weak self] in
-                #if DEBUG
-                print("Network connection restored - evaluating soft reload")
-                #endif
-                self?.softReload(reason: "network")
+                guard let self else { return }
+                // Same as wake: if authenticated + healthy, keep cache warm — no reload storm.
+                if self.isAuthenticated {
+                    self.probePageHealth { broken in
+                        if broken || self.isPageLikelyBrokenSync() {
+                            #if DEBUG
+                            print("Network restored - page broken, soft reload")
+                            #endif
+                            self.softReload(reason: "network-broken")
+                        } else {
+                            #if DEBUG
+                            print("Network restored - soft reload skipped (healthy / cache warm)")
+                            #endif
+                        }
+                    }
+                } else {
+                    #if DEBUG
+                    print("Network connection restored - evaluating soft reload")
+                    #endif
+                    self.softReload(reason: "network")
+                }
             }
             networkReloadWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
@@ -442,8 +508,9 @@ class ViewController: NSViewController {
         wasNetworkConnected = isConnected
     }
 
-    /// Soft-reload: only reload if idle ≥ 30 min OR page looks broken.
-    /// Never reload while key + recently typed. Wake/network never force-reload.
+    /// Soft-reload: only reload if idle ≥ threshold OR page looks broken.
+    /// Never reload while key + recently typed. Wake/network only call this when broken
+    /// (or unauthenticated) — periodic timer still uses idle.
     private func softReload(reason: String) {
         let idle = Date().timeIntervalSince(lastUserInteraction)
         let recentlyTyped = idle < recentTypingSeconds
@@ -457,10 +524,10 @@ class ViewController: NSViewController {
             return
         }
 
-        // Avoid reload storms: at most once per 10 minutes unless page looks broken.
+        // Avoid reload storms: at most once per 15 minutes unless page looks broken.
         let sinceLast = Date().timeIntervalSince(lastReloadDate)
         let pageBroken = isPageLikelyBrokenSync()
-        if !pageBroken && sinceLast < 10 * 60 {
+        if !pageBroken && sinceLast < 15 * 60 {
             #if DEBUG
             print("Soft reload skipped (\(reason)): reloaded \(Int(sinceLast))s ago")
             #endif
@@ -469,7 +536,7 @@ class ViewController: NSViewController {
         }
 
         let idleEnough = idle >= softReloadIdleSeconds
-        // periodic-timer only reloads when actually idle or broken — never force.
+        // Broken reasons always reload when sync heuristic says broken; idle for timer/resign.
         if pageBroken || idleEnough {
             performReload(reason: reason)
         } else {
@@ -550,6 +617,7 @@ class ViewController: NSViewController {
     }
 
     /// Warm UX: window hide/show never starves badge/noti by itself.
+    /// WebView stays in the window hierarchy on orderOut (suspend OFF) for instant reopen.
     /// Only when suspendWhenHidden is ON: pause media + hide webView + pause observers.
     func notifyWindowVisibility(_ visible: Bool) {
         windowVisible = visible
@@ -709,16 +777,28 @@ class ViewController: NSViewController {
     // MARK: - Badge Updates
 
     private func updateBadge(count: Int) {
-        DispatchQueue.main.async {
-            // Dock badge always — trusted even when menu bar is off.
+        // Coalesce rapid IPC from MutationObserver into one Dock/status update.
+        pendingBadgeCount = count
+        badgeApplyWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard let count = self.pendingBadgeCount else { return }
+            self.pendingBadgeCount = nil
+            guard count != self.lastAppliedBadgeCount else { return }
+            self.lastAppliedBadgeCount = count
             if count > 0 {
                 NSApp.dockTile.badgeLabel = "\(count)"
             } else {
                 NSApp.dockTile.badgeLabel = nil
             }
-            NotificationCenter.default.post(
-                name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
+            // Menu bar is the only NC consumer — skip post when disabled.
+            if GoofySettings.menuBarEnabled {
+                NotificationCenter.default.post(
+                    name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
+            }
         }
+        badgeApplyWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
     // MARK: - Show Notification

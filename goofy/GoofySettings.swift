@@ -17,6 +17,8 @@ enum GoofySettings {
         static let menuBarEnabled = "goofy.menuBarEnabled"
         static let forceReduceMotion = "goofy.forceReduceMotion"
         static let suspendWhenHidden = "goofy.suspendWhenHidden"
+        /// Keep WebKit/process warm (anti–App Nap). Default ON for smooth reopen/switch.
+        static let keepProcessWarm = "goofy.keepProcessWarm"
     }
 
     enum NotificationMode: String, CaseIterable {
@@ -78,4 +80,20 @@ enum GoofySettings {
         }
         set { UserDefaults.standard.set(newValue, forKey: Key.suspendWhenHidden) }
     }
+
+    /// Default ON — hold an NSActivity so App Nap does not starve WebKit while window is ordered out.
+    static var keepProcessWarm: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: Key.keepProcessWarm) == nil { return true }
+            return UserDefaults.standard.bool(forKey: Key.keepProcessWarm)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Key.keepProcessWarm) }
+    }
+
+    // MARK: - Web cache capacities (not UserDefaults — always-on for smooth UX / high RAM OK)
+
+    /// Shared URLCache memory capacity (bytes). Helps URLSession + some WebKit shared paths.
+    static let urlCacheMemoryCapacity = 512 * 1024 * 1024  // 512 MB
+    /// Shared URLCache disk capacity (bytes).
+    static let urlCacheDiskCapacity = 2 * 1024 * 1024 * 1024  // 2 GB
 }
