@@ -3,8 +3,8 @@
 //  goofy
 //
 //  Created by Daniel Büchele on 02/01/2026.
-//  Warm-UX: keep badge/noti warm while backgrounded; Always on Top + ⌘⇧Y restored;
-//  media video-only gate; suspendWhenHidden still opt-in for idle CPU tradeoff.
+//  Warm-UX + smooth-cache: large URLCache; keep-process-warm; badge/noti warm;
+//  Always on Top + ⌘⇧Y; suspendWhenHidden still opt-in.
 //
 
 import AppUpdater
@@ -26,8 +26,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var updaterSubscribed = false
     private var globalHotkeyMonitor: Any?
     private var localHotkeyMonitor: Any?
+    private var keepWarmActivity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        updateKeepWarmActivity()
         if let window = NSApplication.shared.windows.first {
             window.delegate = self
             window.setFrameAutosaveName("MainWindow")
@@ -58,6 +60,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         updateCheckWorkItem?.cancel()
+        endKeepWarmActivity()
         if let globalHotkeyMonitor {
             NSEvent.removeMonitor(globalHotkeyMonitor)
         }
@@ -71,8 +74,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // orderOut keeps the window + WKWebView in memory (instant reopen).
+        // Do not removeFromSuperview / do not clear website data here.
         sender.orderOut(nil)
-        // Tell web content to pause observers while window is hidden.
         viewController()?.notifyWindowVisibility(false)
         return false
     }
@@ -286,6 +290,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             makeCheckItem(
                 "Suspend When Hidden", #selector(toggleSuspendWhenHidden(_:)),
                 GoofySettings.suspendWhenHidden))
+        extras.addItem(
+            makeCheckItem(
+                "Keep Process Warm", #selector(toggleKeepProcessWarm(_:)),
+                GoofySettings.keepProcessWarm))
         extras.addItem(NSMenuItem.separator())
 
         let notiMenu = NSMenu(title: "Notifications")
@@ -365,6 +373,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     item.state = GoofySettings.forceReduceMotion ? .on : .off
                 case "Suspend When Hidden":
                     item.state = GoofySettings.suspendWhenHidden ? .on : .off
+                case "Keep Process Warm":
+                    item.state = GoofySettings.keepProcessWarm ? .on : .off
                 case "Banner", "Badge only", "Off":
                     if let raw = item.representedObject as? String {
                         item.state = GoofySettings.notificationMode.rawValue == raw ? .on : .off
@@ -411,6 +421,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshCheckStates()
     }
 
+    @objc func toggleKeepProcessWarm(_ sender: Any?) {
+        GoofySettings.keepProcessWarm.toggle()
+        updateKeepWarmActivity()
+        refreshCheckStates()
+    }
+
+    /// Hold an NSActivity so App Nap does not throttle WebKit while the window is ordered out.
+    private func updateKeepWarmActivity() {
+        if GoofySettings.keepProcessWarm {
+            if keepWarmActivity == nil {
+                keepWarmActivity = ProcessInfo.processInfo.beginActivity(
+                    options: [.userInitiatedAllowingIdleSystemSleep],
+                    reason: "Goofy keep Messenger WebKit warm for smooth reopen")
+            }
+        } else {
+            endKeepWarmActivity()
+        }
+    }
+
+    private func endKeepWarmActivity() {
+        if let keepWarmActivity {
+            ProcessInfo.processInfo.endActivity(keepWarmActivity)
+            self.keepWarmActivity = nil
+        }
+    }
+
     @objc func setNotificationMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
             let mode = GoofySettings.NotificationMode(rawValue: raw)
@@ -435,7 +471,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let alert = NSAlert()
         alert.messageText = "Goofy Preferences"
         alert.informativeText =
-            "Warm UX: badge/noti stay live while backgrounded. Menu bar, force reduce motion, and suspend-when-hidden default OFF. Global ⌘⇧Y toggles the window (may need Accessibility)."
+            "Smooth cache: 512MB/2GB URLCache; keep-process-warm default ON. Badge/noti stay live while backgrounded. Menu bar, force reduce motion, suspend-when-hidden default OFF. Global ⌘⇧Y toggles the window (may need Accessibility)."
         alert.alertStyle = .informational
 
         let stack = NSStackView()
@@ -469,6 +505,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ("Menu Bar Icon", GoofySettings.menuBarEnabled, #selector(toggleMenuBar(_:))),
             ("Force reduce motion", GoofySettings.forceReduceMotion, #selector(toggleForceReduceMotion(_:))),
             ("Suspend web content when hidden", GoofySettings.suspendWhenHidden, #selector(toggleSuspendWhenHidden(_:))),
+            ("Keep process warm (anti–App Nap)", GoofySettings.keepProcessWarm, #selector(toggleKeepProcessWarm(_:))),
         ]
 
         for (title, on, action) in toggles {
@@ -477,7 +514,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stack.addArrangedSubview(button)
         }
 
-        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 230)
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 260)
         alert.accessoryView = stack
         alert.addButton(withTitle: "OK")
         alert.runModal()

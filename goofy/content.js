@@ -13,6 +13,7 @@ window.__GOOFY = {
   _activeObservers: [],
   _lastCurrentThreadKey: undefined,
   _lastBadgeCount: -1,
+  _mediaDecorateBusy: false,
   _debug: false,
 
   postToNative: function (message) {
@@ -479,11 +480,33 @@ window.__GOOFY = {
     this.debounce(
       "messages",
       () => {
-        this.checkForNewMessages();
-        this.updateBadgeCount();
+        // One rAF so badge + thread IPC land in the same frame (less main-thread churn).
+        requestAnimationFrame(() => {
+          this.checkForNewMessages();
+          this.updateBadgeCount();
+          this.decorateMediaLazy();
+        });
       },
       this.debounceMs(),
     );
+  },
+
+  // Hint async image decode — avoid layout thrash; no getComputedStyle.
+  decorateMediaLazy: function () {
+    if (this._mediaDecorateBusy) return;
+    this._mediaDecorateBusy = true;
+    try {
+      const imgs = document.querySelectorAll("img:not([data-goofy-decode])");
+      const limit = Math.min(imgs.length, 40);
+      for (let i = 0; i < limit; i++) {
+        const img = imgs[i];
+        img.setAttribute("data-goofy-decode", "1");
+        if (!img.getAttribute("decoding")) img.decoding = "async";
+      }
+    } catch (_) {
+    } finally {
+      this._mediaDecorateBusy = false;
+    }
   },
 
   // --- Init ---
@@ -535,6 +558,9 @@ window.__GOOFY = {
         this.setAppState("foreground");
       }
     });
+
+    // One-shot media decorate after first paint (does not pause observers).
+    requestAnimationFrame(() => this.decorateMediaLazy());
   },
 };
 

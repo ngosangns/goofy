@@ -23,6 +23,16 @@ h1.html-h1 {
     justify-content: flex-end !important;
 }
 
+/*
+ * Smooth scroll / thread paint: promote primary surfaces to their own layers.
+ * User accepts higher RAM — avoid permanent will-change (can inflate layers).
+ * forceReduceMotion stays OFF by default (see goofy-force-reduce-motion below).
+ */
+[role="main"],
+[role="grid"],
+[role="row"] {
+    -webkit-font-smoothing: antialiased;
+}
 
 /* Respect system Reduce Motion — cuts Messenger transition/animation CPU when enabled. */
 @media (prefers-reduced-motion: reduce) {

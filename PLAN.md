@@ -221,3 +221,40 @@ Priority: snappy badge/noti + restored UX; user accepts higher RAM / background 
 - Force reduce motion: **OFF**
 - Suspend when hidden: **OFF**
 
+## Phase smooth-cache — fluid UX / large cache (v4.0.159)
+
+**Status: done** (branch `feat/smooth-cache`)
+
+Priority: perceived smoothness (scroll, thread switch, reopen, media). User accepts high RAM.
+
+| # | Việc | Kết quả |
+|---|------|---------|
+| S.1 | Large shared `URLCache` | **512 MB** memory + **2 GB** disk under Caches/GoofyURLCache |
+| S.2 | WK config | `websiteDataStore.default`, shared `WKProcessPool`, `suppressesIncrementalRendering=false` |
+| S.3 | Force-cache friendly load | Initial `URLRequest` `.returnCacheDataElseLoad`; soft-reload less aggressive |
+| S.4 | Soft-reload | Idle **45 min**; anti-storm **15 min**; wake/network reload **only if broken** when authenticated |
+| S.5 | Prewarm | `loadMessenger` in `viewDidLoad` (not deferred to appear) |
+| S.6 | Keep warm | `goofy.keepProcessWarm` default **ON** — `NSActivity` userInitiatedAllowingIdleSystemSleep |
+| S.7 | Badge IPC | 50ms coalesce; skip `.goofyBadgeDidChange` when menu bar off |
+| S.8 | CSS/JS | Compositing-friendly font smoothing; async `img.decoding`; rAF-batched checks; forceReduceMotion still OFF |
+| S.9 | Window close | `orderOut` keeps WKWebView in hierarchy; no aggressive website-data clear |
+
+### New UserDefaults
+- `goofy.keepProcessWarm` — Bool, **default ON**
+
+### Cache sizes (hardcoded, not UserDefaults)
+- Memory: 512 MB (`GoofySettings.urlCacheMemoryCapacity`)
+- Disk: 2 GB (`GoofySettings.urlCacheDiskCapacity`)
+
+### Defaults
+- Menu bar: **OFF**
+- Always on Top: **OFF**
+- Force reduce motion: **OFF**
+- Suspend when hidden: **OFF**
+- Keep process warm: **ON**
+
+### Risks
+- Higher RAM / disk cache footprint (intentional).
+- `returnCacheDataElseLoad` may briefly show a stale Messenger shell until soft-reload/broken probe; wake no longer idle-reloads when healthy.
+- `WKProcessPool` may warn deprecated on newest SDKs (harmless; process sharing still OK).
+- Keep-warm NSActivity reduces App Nap savings (battery tradeoff).
