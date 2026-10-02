@@ -258,3 +258,23 @@ Priority: perceived smoothness (scroll, thread switch, reopen, media). User acce
 - `returnCacheDataElseLoad` may briefly show a stale Messenger shell until soft-reload/broken probe; wake no longer idle-reloads when healthy.
 - `WKProcessPool` may warn deprecated on newest SDKs (harmless; process sharing still OK).
 - Keep-warm NSActivity reduces App Nap savings (battery tradeoff).
+
+---
+
+## Phase upstream-ports — recommended upstream fixes (v4.0.160)
+
+**Status: done** (branch `feat/upstream-ports`)
+
+Port of recommended items from upstream issues/PRs into this fork only (never push to danielbuechele).
+
+| # | Việc | Kết quả |
+|---|------|---------|
+| U.1 | Keep-alive (#524 style) | Native `Timer` → `evaluateJS __GOOFY.keepAlive` every ~15s while window hidden and `suspendWhenHidden` OFF; ~60s when visible; disabled when suspend ON |
+| U.2 | i18n own-snippet (#519) | Expanded `IGNORED_SNIPPET_PREFIXES` + `OWN_SNIPPET_REGEX` (You/Ty/Bạn/Du/Tu/Vous/…) via `isOwnSnippet` |
+| U.3 | Now Playing (#521) | Clear `MPNowPlayingInfoCenter` + page `mediaSession` when no real audio/video; ignore short noti pings |
+| U.4 | Image save (#508) | `shouldPerformDownload`, `navigationResponse` → download, sheet `NSSavePanel`, context-menu **Save Image…** via URLSession |
+| U.5 | Reopen harden (#520) | Retain main window, `isReleasedWhenClosed=false`, deminiaturize before orderOut, off-screen frame repair, `orderFrontRegardless` fallback |
+
+### Defaults
+- Keep-alive: active when hidden + suspend OFF (no new UserDefaults)
+- Suspend when hidden: still **OFF**

@@ -16,6 +16,7 @@ Everything upstream has, plus (this fork) — **speed-first**:
 |------|----------------|
 | Perf | Debounced + narrowed observers; soft-reload + wake health probe; App Nap-friendly timers; optional force reduce-motion / suspend-when-hidden (default off); tracker content rules; Release LTO/strip; delayed updater |
 | Smooth cache | 512MB/2GB `URLCache`; cache-friendly Messenger load; wake/network reload only if broken; `loadMessenger` on `viewDidLoad`; keep-process-warm (default ON); coalesced badge IPC |
+| Upstream ports (4.0.160) | Hidden-window keep-alive; i18n own-snippet ignore; Now Playing clear for noti pings; Save Image… context menu; reopen harden after close/minimize |
 | Warm UX | Badge/noti observers stay live while backgrounded (unless Suspend When Hidden); Dock badge trusted with menu bar off; video-only media gesture gate (audio/voice OK); Always on Top + global `⌘⇧Y` show/hide |
 | Notifications | Suppress banner when the window is key on the same thread; modes Banner / Badge-only / Off; optional hide message preview |
 | Keyboard | `⌘1`–`⌘9` jump conversations; `⌘[` / `⌘]` previous/next; `⌘⇧Y` show/hide window |

@@ -5,6 +5,7 @@
 //  Created by Daniel Büchele on 02/01/2026.
 //  Warm-UX + smooth-cache: large URLCache; keep-process-warm; badge/noti warm;
 //  Always on Top + ⌘⇧Y; suspendWhenHidden still opt-in.
+//  Upstream ports: keep-alive (#524), reopen harden (#520).
 //
 
 import AppUpdater
@@ -27,12 +28,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var globalHotkeyMonitor: Any?
     private var localHotkeyMonitor: Any?
     private var keepWarmActivity: NSObjectProtocol?
+    /// Strong ref so close/minimize cycles cannot drop the only window (#520).
+    private var retainedMainWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         updateKeepWarmActivity()
         if let window = NSApplication.shared.windows.first {
+            retainedMainWindow = window
             window.delegate = self
             window.setFrameAutosaveName("MainWindow")
+            window.isReleasedWhenClosed = false
             applyAlwaysOnTop(GoofySettings.alwaysOnTop, window: window)
         }
 
@@ -76,12 +81,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         // orderOut keeps the window + WKWebView in memory (instant reopen).
         // Do not removeFromSuperview / do not clear website data here.
+        // Deminiaturize first — orderOut of a miniaturized window is a Sequoia
+        // footgun that can leave the Dock unable to restore (#520).
+        if sender.isMiniaturized {
+            sender.deminiaturize(nil)
+        }
+        retainedMainWindow = sender
+        sender.isReleasedWhenClosed = false
         sender.orderOut(nil)
         viewController()?.notifyWindowVisibility(false)
         return false
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        viewController()?.notifyWindowVisibility(true)
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        if let window = notification.object as? NSWindow {
+            retainedMainWindow = window
+        }
+        viewController()?.notifyWindowVisibility(false)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        if let window = notification.object as? NSWindow {
+            retainedMainWindow = window
+        }
         viewController()?.notifyWindowVisibility(true)
     }
 
@@ -107,8 +133,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Window helpers
 
     func mainWindow() -> NSWindow? {
-        NSApplication.shared.windows.first { $0.contentViewController is ViewController }
+        if let retainedMainWindow,
+           retainedMainWindow.contentViewController is ViewController {
+            return retainedMainWindow
+        }
+        let found = NSApplication.shared.windows.first { $0.contentViewController is ViewController }
             ?? NSApplication.shared.windows.first
+        if let found {
+            retainedMainWindow = found
+            found.isReleasedWhenClosed = false
+            found.delegate = self
+        }
+        return found
     }
 
     func viewController() -> ViewController? {
@@ -117,11 +153,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        for window in NSApplication.shared.windows {
-            if window.isMiniaturized {
-                window.deminiaturize(self)
+        guard let window = mainWindow() else {
+            // Last resort: any app window.
+            NSApplication.shared.windows.forEach { $0.makeKeyAndOrderFront(self) }
+            return
+        }
+        retainedMainWindow = window
+        window.isReleasedWhenClosed = false
+        if window.delegate == nil {
+            window.delegate = self
+        }
+        if window.isMiniaturized {
+            window.deminiaturize(self)
+        }
+        // Force on-screen even after repeated orderOut / minimize cycles (#520).
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            var frame = window.frame
+            if !screen.visibleFrame.intersects(frame) {
+                frame.origin = NSPoint(
+                    x: screen.visibleFrame.midX - frame.width / 2,
+                    y: screen.visibleFrame.midY - frame.height / 2
+                )
+                window.setFrame(frame, display: true)
             }
-            window.makeKeyAndOrderFront(self)
+        }
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.makeKeyAndOrderFront(self)
+        if !window.isVisible {
+            window.orderFrontRegardless()
         }
         viewController()?.notifyWindowVisibility(true)
     }
@@ -131,7 +190,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             showMainWindow()
             return
         }
-        if window.isVisible && NSApp.isActive {
+        let reallyVisible = window.isVisible && !window.isMiniaturized && NSApp.isActive
+        if reallyVisible {
             window.orderOut(nil)
             viewController()?.notifyWindowVisibility(false)
         } else {
@@ -418,6 +478,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func toggleSuspendWhenHidden(_ sender: Any?) {
         GoofySettings.suspendWhenHidden.toggle()
+        viewController()?.suspendWhenHiddenSettingDidChange()
         refreshCheckStates()
     }
 

@@ -6,6 +6,7 @@
 //
 
 import AVFoundation
+import MediaPlayer
 import Cocoa
 import Network
 import UserNotifications
@@ -39,6 +40,13 @@ class ViewController: NSViewController {
     private var windowConfigured = false
     private var isAuthenticated = false
     private var safariLoginController: SafariLoginController?
+
+    // Keep-alive (upstream #524 style): native Timer wakes WebKit while hidden.
+    private let keepAliveHiddenInterval: TimeInterval = 15
+    private let keepAliveVisibleInterval: TimeInterval = 60  // less frequent when visible
+    private var keepAliveTimer: Timer?
+    private var nowPlayingClearWorkItem: DispatchWorkItem?
+    private var realMediaPlaying = false
 
     // Soft-reload / interaction tracking
     private var lastUserInteraction = Date()
@@ -82,12 +90,15 @@ class ViewController: NSViewController {
         if !windowConfigured {
             configureWindow()
             setupPeriodicReload()
+            setupKeepAlive()
             windowConfigured = true
         }
     }
 
     deinit {
         reloadTimer?.invalidate()
+        keepAliveTimer?.invalidate()
+        nowPlayingClearWorkItem?.cancel()
         networkMonitor?.cancel()
         networkReloadWorkItem?.cancel()
         badgeApplyWorkItem?.cancel()
@@ -206,6 +217,7 @@ class ViewController: NSViewController {
 
         // Create WebView
         webView = GoofyWebView(frame: view.bounds, configuration: configuration)
+        webView.goofyHost = self
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -427,6 +439,125 @@ class ViewController: NSViewController {
         setupNetworkMonitor()
     }
 
+    // MARK: - Keep Alive (#524)
+
+    /// WebKit suspends page JS when the window is hidden. Native timers are not
+    /// throttled the same way — evaluateJS keepAlive every ~15s while hidden
+    /// (and suspendWhenHidden is OFF) so badge/noti keep working. When visible,
+    /// fire less often (or effectively idle). When suspendWhenHidden is ON,
+    /// keep-alive is disabled so the intentional suspend stays suspended.
+    private func setupKeepAlive() {
+        rescheduleKeepAliveTimer()
+    }
+
+    private func rescheduleKeepAliveTimer() {
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = nil
+
+        // Respect intentional suspend — no keep-alive.
+        if GoofySettings.suspendWhenHidden && !windowVisible {
+            return
+        }
+        if webContentSuspended {
+            return
+        }
+
+        let interval: TimeInterval
+        if windowVisible {
+            interval = keepAliveVisibleInterval
+        } else {
+            interval = keepAliveHiddenInterval
+        }
+
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.fireKeepAlive()
+        }
+        timer.tolerance = min(2.0, interval * 0.2)
+        RunLoop.main.add(timer, forMode: .common)
+        keepAliveTimer = timer
+    }
+
+    private func fireKeepAlive() {
+        guard webView != nil else { return }
+        // Re-check policy each tick (setting / visibility may have changed).
+        if GoofySettings.suspendWhenHidden && !windowVisible { return }
+        if webContentSuspended { return }
+
+        webView.evaluateJavaScript(
+            "window.__GOOFY && window.__GOOFY.keepAlive && window.__GOOFY.keepAlive();",
+            in: nil, in: .defaultClient
+        ) { result in
+            if case .failure(let error) = result {
+                #if DEBUG
+                print("Keep-alive failed: \(error)")
+                #endif
+            }
+        }
+
+        // Opportunistically clear stolen Now Playing while hidden/idle.
+        reconcileNowPlaying()
+    }
+
+    // MARK: - Now Playing (#521)
+
+    /// Clear MPNowPlayingInfoCenter / page Media Session when we are not playing
+    /// real Messenger media — notification pings must not steal media keys.
+    private func reconcileNowPlaying() {
+        guard webView != nil else { return }
+        webView.evaluateJavaScript(
+            "window.__GOOFY && window.__GOOFY.hasRealMediaPlaying && window.__GOOFY.hasRealMediaPlaying();",
+            in: nil, in: .defaultClient
+        ) { [weak self] result in
+            var playing = false
+            if case .success(let value) = result {
+                playing = (value as? Bool) == true
+            }
+            DispatchQueue.main.async {
+                self?.applyNowPlayingState(playing: playing)
+            }
+        }
+        // Also clear page-world Media Session (Messenger sets it there).
+        let clearScript = """
+            (function(){
+              try {
+                var els = document.querySelectorAll('audio,video');
+                var real = false;
+                for (var i = 0; i < els.length; i++) {
+                  var el = els[i];
+                  if (el.paused || el.ended) continue;
+                  if (el.tagName === 'VIDEO' && (el.videoWidth > 0 || el.offsetWidth > 40)) { real = true; break; }
+                  if (el.tagName === 'AUDIO' && isFinite(el.duration) && el.duration > 5) { real = true; break; }
+                }
+                if (!real && navigator.mediaSession) {
+                  navigator.mediaSession.metadata = null;
+                  navigator.mediaSession.playbackState = 'none';
+                }
+                return real;
+              } catch (e) { return false; }
+            })();
+            """
+        webView.evaluateJavaScript(clearScript, in: nil, in: .page) { _ in }
+    }
+
+    private func applyNowPlayingState(playing: Bool) {
+        realMediaPlaying = playing
+        if playing {
+            nowPlayingClearWorkItem?.cancel()
+            nowPlayingClearWorkItem = nil
+            return
+        }
+        nowPlayingClearWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.realMediaPlaying else { return }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            if #available(macOS 10.12.2, *) {
+                MPNowPlayingInfoCenter.default().playbackState = .stopped
+            }
+        }
+        nowPlayingClearWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+
     private func setupNetworkMonitor() {
         networkMonitor = NWPathMonitor()
         networkMonitor?.pathUpdateHandler = { [weak self] path in
@@ -633,6 +764,7 @@ class ViewController: NSViewController {
                 suspendWebContent()
             }
         }
+        rescheduleKeepAliveTimer()
     }
 
     /// Pause videos, hide web view, and pause JS observers. Does NOT clear cookies/session.
@@ -640,6 +772,7 @@ class ViewController: NSViewController {
     private func suspendWebContent() {
         guard !webContentSuspended, webView != nil else { return }
         webContentSuspended = true
+        rescheduleKeepAliveTimer()
         let script = """
             if (window.__GOOFY) {
               window.__GOOFY.pauseMedia && window.__GOOFY.pauseMedia();
@@ -654,6 +787,7 @@ class ViewController: NSViewController {
         guard webContentSuspended, webView != nil else { return }
         webContentSuspended = false
         webView.isHidden = false
+        rescheduleKeepAliveTimer()
         let script = "window.__GOOFY && window.__GOOFY.setSuspended && window.__GOOFY.setSuspended(false);"
         webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
     }
@@ -930,6 +1064,15 @@ extension ViewController: WKScriptMessageHandler {
                 print("[Goofy JS] \(logMessage)")
             }
 
+        case "nowPlaying":
+            let state = body["state"] as? String
+            applyNowPlayingState(playing: state == "playing")
+
+        case "saveImage":
+            if let urlString = body["url"] as? String {
+                saveImage(from: urlString, suggestedName: body["filename"] as? String)
+            }
+
         default:
             break
         }
@@ -946,6 +1089,12 @@ extension ViewController: WKNavigationDelegate {
     ) {
         guard let url = navigationAction.request.url else {
             decisionHandler(.allow)
+            return
+        }
+
+        // User-initiated download (Save Image / download attr) — macOS 11.3+.
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
             return
         }
 
@@ -1130,6 +1279,25 @@ extension ViewController: WKUIDelegate {
         return nil
     }
 
+    func webView(
+        _ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        // Promote opaque / attachment responses to WKDownload (#508).
+        if let http = navigationResponse.response as? HTTPURLResponse {
+            let disposition = (http.value(forHTTPHeaderField: "Content-Disposition") ?? "").lowercased()
+            if disposition.hasPrefix("attachment") {
+                decisionHandler(.download)
+                return
+            }
+        }
+        if !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
         download.delegate = self
     }
@@ -1261,18 +1429,170 @@ extension ViewController: WKUIDelegate {
     }
 }
 
+// MARK: - Image save helpers (#508)
+
+extension ViewController {
+    /// Download an image URL (http/https/data) via URLSession + NSSavePanel.
+    /// Used by context-menu "Save Image…" when WKDownload path is unreliable.
+    func saveImage(from urlString: String, suggestedName: String? = nil) {
+        if urlString.hasPrefix("data:") {
+            saveDataURLImage(urlString, suggestedName: suggestedName)
+            return
+        }
+        guard let url = URL(string: urlString), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            presentDownloadError("Could not save image — invalid URL.")
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        let defaultName = suggestedName?.isEmpty == false
+            ? suggestedName!
+            : (url.lastPathComponent.isEmpty ? "image.jpg" : url.lastPathComponent)
+        panel.nameFieldStringValue = sanitizeFilename(defaultName)
+        guard let window = view.window else {
+            // Fall back to app-modal if no window.
+            panel.begin { [weak self] result in
+                guard result == .OK, let dest = panel.url else { return }
+                self?.downloadFile(from: url, to: dest)
+            }
+            return
+        }
+        panel.beginSheetModal(for: window) { [weak self] result in
+            guard result == .OK, let dest = panel.url else { return }
+            self?.downloadFile(from: url, to: dest)
+        }
+    }
+
+    private func saveDataURLImage(_ dataURL: String, suggestedName: String?) {
+        guard let comma = dataURL.firstIndex(of: ",") else {
+            presentDownloadError("Could not decode image data.")
+            return
+        }
+        let meta = String(dataURL[dataURL.startIndex..<comma])
+        let payload = String(dataURL[dataURL.index(after: comma)...])
+        let data: Data?
+        if meta.contains(";base64") {
+            data = Data(base64Encoded: payload)
+        } else {
+            data = payload.removingPercentEncoding?.data(using: .utf8)
+        }
+        guard let data else {
+            presentDownloadError("Could not decode image data.")
+            return
+        }
+        var name = suggestedName ?? "image.png"
+        if meta.contains("image/jpeg") || meta.contains("image/jpg") { name = suggestedName ?? "image.jpg" }
+        else if meta.contains("image/webp") { name = suggestedName ?? "image.webp" }
+        else if meta.contains("image/gif") { name = suggestedName ?? "image.gif" }
+
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = sanitizeFilename(name)
+        let present: (NSApplication.ModalResponse, URL?) -> Void = { result, dest in
+            guard result == .OK, let dest else { return }
+            do {
+                try data.write(to: dest, options: .atomic)
+            } catch {
+                self.presentDownloadError(error.localizedDescription)
+            }
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window) { result in present(result, panel.url) }
+        } else {
+            present(panel.runModal(), panel.url)
+        }
+    }
+
+    private func downloadFile(from url: URL, to dest: URL) {
+        let task = URLSession.shared.downloadTask(with: url) { [weak self] temp, _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.presentDownloadError(error.localizedDescription)
+                    return
+                }
+                guard let temp else {
+                    self?.presentDownloadError("Download produced no file.")
+                    return
+                }
+                do {
+                    let fm = FileManager.default
+                    if fm.fileExists(atPath: dest.path) {
+                        try fm.removeItem(at: dest)
+                    }
+                    try fm.moveItem(at: temp, to: dest)
+                } catch {
+                    self?.presentDownloadError(error.localizedDescription)
+                }
+            }
+        }
+        task.resume()
+    }
+
+    func sanitizeFilename(_ name: String) -> String {
+        let cleaned = name.replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        return cleaned.isEmpty ? "image.jpg" : cleaned
+    }
+
+    func presentDownloadError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Save Failed"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    /// Called when Preferences toggles suspendWhenHidden so keep-alive policy updates.
+    func suspendWhenHiddenSettingDidChange() {
+        if GoofySettings.suspendWhenHidden && !windowVisible {
+            suspendWebContent()
+        } else if !GoofySettings.suspendWhenHidden && webContentSuspended {
+            restoreWebContentIfNeeded()
+        }
+        rescheduleKeepAliveTimer()
+    }
+}
+
 // MARK: - WKDownloadDelegate
 
 extension ViewController: WKDownloadDelegate {
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                   suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = suggestedFilename
+        panel.nameFieldStringValue = sanitizeFilename(suggestedFilename)
         panel.canCreateDirectories = true
-        if panel.runModal() == .OK {
-            completionHandler(panel.url)
+
+        let finish: (NSApplication.ModalResponse) -> Void = { result in
+            if result == .OK {
+                completionHandler(panel.url)
+            } else {
+                completionHandler(nil)
+            }
+        }
+
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: finish)
         } else {
-            completionHandler(nil)
+            finish(panel.runModal())
+        }
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        #if DEBUG
+        print("Download finished")
+        #endif
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        DispatchQueue.main.async { [weak self] in
+            self?.presentDownloadError(error.localizedDescription)
         }
     }
 }
@@ -1322,7 +1642,11 @@ extension ViewController: UNUserNotificationCenterDelegate {
 /// so the window can be dragged. The drag area is taller on the left side (55px for
 /// the first 200px) when the window is wide enough (664px+), to cover the inset
 /// traffic light buttons. Otherwise it's a uniform 18px strip.
+/// Also adds a reliable "Save Image…" context menu item (#508).
 class GoofyWebView: WKWebView {
+    weak var goofyHost: ViewController?
+    private var pendingMenuPoint: NSPoint?
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         let dragHeight: CGFloat
         if bounds.width >= 664 && point.x <= 200 {
@@ -1334,5 +1658,80 @@ class GoofyWebView: WKWebView {
             return nil
         }
         return super.hitTest(point)
+    }
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        pendingMenuPoint = convert(event.locationInWindow, from: nil)
+
+        // Avoid duplicate if we already inserted one.
+        if menu.items.contains(where: { $0.action == #selector(saveImageFromContextMenu(_:)) }) {
+            return
+        }
+        let item = NSMenuItem(
+            title: "Save Image…",
+            action: #selector(saveImageFromContextMenu(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        menu.insertItem(item, at: 0)
+        menu.insertItem(NSMenuItem.separator(), at: 1)
+    }
+
+    @objc private func saveImageFromContextMenu(_ sender: Any?) {
+        guard let point = pendingMenuPoint else { return }
+        // AppKit Y is bottom-up; DOM elementFromPoint is top-down.
+        let x = point.x
+        let y = bounds.height - point.y
+        let zoom = pageZoom
+        let script = """
+        (function(){
+          var x = \(x) / \(zoom);
+          var y = \(y) / \(zoom);
+          var el = document.elementFromPoint(x, y);
+          if (!el) return null;
+          var img = el.closest ? el.closest('img') : null;
+          if (!img && el.tagName === 'IMG') img = el;
+          if (!img) {
+            var bg = el.closest ? el.closest('[style*="background"]') : null;
+            if (bg) {
+              var s = getComputedStyle(bg).backgroundImage || '';
+              var urlMatch = (function(s){
+                var i = s.indexOf('url(');
+                if (i < 0) return null;
+                var j = s.indexOf(')', i);
+                if (j < 0) return null;
+                var u = s.substring(i + 4, j).trim();
+                if (u.charAt(0) === "'" || u.charAt(0) === '"') u = u.substring(1, u.length - 1);
+                return u;
+              })(s);
+              if (urlMatch) return {url: urlMatch, filename: 'image.jpg'};
+            }
+            return null;
+          }
+          var url = img.currentSrc || img.src || img.getAttribute('src');
+          if (!url) return null;
+          var filename = (url.split('?')[0].split('/').pop()) || 'image.jpg';
+          if (filename.length > 80) filename = 'image.jpg';
+          return {url: url, filename: filename};
+        })();
+        """
+        evaluateJavaScript(script) { [weak self] result, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.goofyHost?.presentDownloadError(error.localizedDescription)
+                    return
+                }
+                guard let dict = result as? [String: Any],
+                      let url = dict["url"] as? String else {
+                    self?.goofyHost?.presentDownloadError(
+                        "No image under the cursor. Try Messenger’s download control, or right-click directly on the image."
+                    )
+                    return
+                }
+                let name = dict["filename"] as? String
+                self?.goofyHost?.saveImage(from: url, suggestedName: name)
+            }
+        }
     }
 }
