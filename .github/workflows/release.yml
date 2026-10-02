@@ -1,0 +1,465 @@
+# Publish Goofy to GitHub Releases for in-app updates.
+#
+# AppUpdater (pinned at 0.2.0) loads https://api.github.com/repos/ngosangns/goofy/releases
+# and installs one asset:
+#   - release is published (not draft, not prerelease)
+#   - tag_name is strict MAJOR.MINOR.PATCH (a leading "v" does not parse)
+#   - asset name is Goofy-<tag>.zip
+#   - asset content_type is application/zip
+# The zip must be `zip -r -y` of Goofy.app. ditto stores provenance xattrs as
+# AppleDouble `._*` files and AppUpdater's /usr/bin/unzip then breaks the signature.
+#
+# Tag pushes and signing=auto do not fail when Apple secrets are missing.
+# The zip is still published, ad-hoc signed. signing=developer-id fails if the
+# certificate secrets are absent. Gatekeeper and AppUpdater installs need a
+# Developer ID build; see docs/RELEASE.md.
+
+name: Release
+
+on:
+  push:
+    tags:
+      # Globs, not regex. 4.0.161 matches 4.*. v4.0.161 matches v[0-9]*.
+      # The published release tag is always unprefixed MAJOR.MINOR.PATCH.
+      - "4.*"
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "MAJOR.MINOR.PATCH (optional leading v). Empty reads MARKETING_VERSION from the Xcode project."
+        required: false
+        type: string
+      signing:
+        description: "auto uses Developer ID when Apple secrets exist, otherwise ad-hoc"
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - adhoc
+          - developer-id
+
+permissions:
+  contents: write
+
+concurrency:
+  group: goofy-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          selected=""
+          for candidate in \
+            /Applications/Xcode_26.6.app \
+            /Applications/Xcode_26.5.app \
+            /Applications/Xcode_26.4.1.app \
+            /Applications/Xcode_26.4.app \
+            /Applications/Xcode.app
+          do
+            if [ -d "$candidate" ]; then
+              sudo xcode-select -s "$candidate"
+              selected="$candidate"
+              break
+            fi
+          done
+          echo "Selected ${selected:-default}"
+          xcodebuild -version
+          major=$(xcodebuild -version | awk 'NR==1 { split($2, p, "."); print p[1] }')
+          if [ "${major:-0}" -lt 26 ]; then
+            echo "::error::Goofy requires Xcode 26 (project objectVersion 77). Found major ${major:-unknown}."
+            exit 1
+          fi
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          project_version=$(grep -m1 'MARKETING_VERSION = ' goofy.xcodeproj/project.pbxproj | sed 's/.*= //' | sed 's/;.*//')
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            raw="$INPUT_VERSION"
+            if [ -z "$raw" ]; then
+              raw="$project_version"
+            fi
+          else
+            raw="$REF_NAME"
+          fi
+          version="${raw#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release version must be MAJOR.MINOR.PATCH (optional leading v). Got '${raw}'."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "PROJECT_VERSION=${project_version}" >> "$GITHUB_ENV"
+          echo "Resolved version ${version} (project MARKETING_VERSION ${project_version})"
+          if [ "$version" != "$project_version" ]; then
+            echo "::warning::Version ${version} differs from MARKETING_VERSION ${project_version}. The archive sets MARKETING_VERSION=${version} so the shipped app matches the release tag."
+          fi
+
+      - name: Skip when this asset is already published
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="Goofy-${VERSION}.zip"
+          if json=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" 2>/dev/null); then
+            ok=$(printf '%s' "$json" | jq -r --arg name "$name" '
+              (.draft | not) and (.prerelease | not) and
+              ([.assets[] | select(.name == $name and .content_type == "application/zip")] | length > 0)
+            ')
+          else
+            ok=false
+          fi
+          if [ "$ok" = "true" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION} already has ${name} (application/zip, published). Skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide signing mode
+        id: signing
+        if: steps.skip.outputs.exists != 'true'
+        env:
+          MODE: ${{ github.event.inputs.signing || 'auto' }}
+          P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          DEV_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          has_cert=false
+          has_notary=false
+          if [ -n "${P12}" ] && [ -n "${P12_PASSWORD}" ] && { [ -n "${TEAM}" ] || [ -n "${DEV_TEAM}" ]; }; then
+            has_cert=true
+          fi
+          if [ -n "${API_KEY}" ] && [ -n "${API_KEY_ID}" ] && [ -n "${API_ISSUER}" ]; then
+            has_notary=true
+          fi
+          mode="${MODE:-auto}"
+          case "$mode" in
+            adhoc) signing=adhoc ;;
+            developer-id)
+              if [ "$has_cert" != true ]; then
+                echo "::error::signing=developer-id requires APPLE_CERTIFICATE_P12, APPLE_CERTIFICATE_PASSWORD, and APPLE_TEAM_ID (or DEVELOPMENT_TEAM)."
+                exit 1
+              fi
+              signing=developer-id
+              ;;
+            auto)
+              if [ "$has_cert" = true ]; then
+                signing=developer-id
+              else
+                signing=adhoc
+                echo "Apple certificate secrets are incomplete. Publishing an ad-hoc signed zip."
+              fi
+              ;;
+            *)
+              echo "::error::Unknown signing mode '${mode}'."
+              exit 1
+              ;;
+          esac
+          notarize=false
+          if [ "$signing" = "developer-id" ] && [ "$has_notary" = true ]; then
+            notarize=true
+          elif [ "$signing" = "developer-id" ]; then
+            echo "::warning::Developer ID certificate is set, notarytool secrets are not. The zip will be signed and not notarized."
+          fi
+          team="${DEV_TEAM:-$TEAM}"
+          echo "mode=${signing}" >> "$GITHUB_OUTPUT"
+          echo "notarize=${notarize}" >> "$GITHUB_OUTPUT"
+          echo "SIGNING=${signing}" >> "$GITHUB_ENV"
+          echo "NOTARIZE=${notarize}" >> "$GITHUB_ENV"
+          echo "APPLE_TEAM=${team}" >> "$GITHUB_ENV"
+          echo "Signing mode: ${signing}; notarize: ${notarize}"
+
+      - name: Import Developer ID certificate
+        if: steps.skip.outputs.exists != 'true' && steps.signing.outputs.mode == 'developer-id'
+        env:
+          P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          printf '%s' "$KEYCHAIN_PASSWORD" > "$RUNNER_TEMP/keychain-password"
+          chmod 600 "$RUNNER_TEMP/keychain-password"
+          echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> "$GITHUB_ENV"
+
+          printf '%s' "$P12" | tr -d '[:space:]' | base64 -D > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -P "$P12_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          existing=$(security list-keychains -d user | sed 's/"//g' | tr '\n' ' ')
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $existing
+          security default-keychain -s "$KEYCHAIN_PATH"
+          rm -f "$RUNNER_TEMP/certificate.p12"
+
+          if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q "Developer ID Application"; then
+            echo "::error::The imported .p12 has no 'Developer ID Application' identity. Apple Development certificates cannot notarize or match AppUpdater's Developer ID check."
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+      - name: Resolve Swift packages
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project goofy.xcodeproj \
+            -scheme goofy \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+
+      - name: Archive
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          args=(
+            -project goofy.xcodeproj
+            -scheme goofy
+            -configuration Release
+            -destination "generic/platform=macOS"
+            -archivePath build/Goofy.xcarchive
+            -skipPackagePluginValidation
+            -skipMacroValidation
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+            "MARKETING_VERSION=${VERSION}"
+          )
+          if [ "$SIGNING" = "developer-id" ]; then
+            keychain_password=$(cat "$RUNNER_TEMP/keychain-password")
+            security unlock-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+            args+=(
+              CODE_SIGN_STYLE=Manual
+              "CODE_SIGN_IDENTITY=Developer ID Application"
+              "CODE_SIGN_IDENTITY[sdk=macosx*]=Developer ID Application"
+              "DEVELOPMENT_TEAM=${APPLE_TEAM}"
+              "OTHER_CODE_SIGN_FLAGS=--keychain ${KEYCHAIN_PATH}"
+            )
+          else
+            # The project pins an upstream development team. Disable signing
+            # here and ad-hoc sign the product after the archive.
+            args+=(
+              CODE_SIGN_STYLE=Manual
+              CODE_SIGNING_ALLOWED=NO
+              CODE_SIGNING_REQUIRED=NO
+              "CODE_SIGN_IDENTITY="
+              "CODE_SIGN_IDENTITY[sdk=macosx*]="
+              "DEVELOPMENT_TEAM="
+            )
+          fi
+          xcodebuild archive "${args[@]}"
+
+      - name: Export Developer ID app
+        if: steps.skip.outputs.exists != 'true' && steps.signing.outputs.mode == 'developer-id'
+        run: |
+          set -euo pipefail
+          keychain_password=$(cat "$RUNNER_TEMP/keychain-password")
+          security unlock-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+          mkdir -p build
+          export_plist=build/ExportOptions.plist
+          rm -f "$export_plist"
+          /usr/libexec/PlistBuddy \
+            -c "Add :method string developer-id" \
+            -c "Add :destination string export" \
+            -c "Add :signingStyle string manual" \
+            -c "Add :signingCertificate string Developer ID Application" \
+            -c "Add :teamID string ${APPLE_TEAM}" \
+            "$export_plist"
+          plutil -lint "$export_plist"
+          xcodebuild -exportArchive \
+            -archivePath build/Goofy.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist build/ExportOptions.plist
+
+      - name: Copy and ad-hoc sign
+        if: steps.skip.outputs.exists != 'true' && steps.signing.outputs.mode == 'adhoc'
+        run: |
+          set -euo pipefail
+          mkdir -p build/export
+          rm -rf build/export/Goofy.app
+          app=$(find build/Goofy.xcarchive/Products -name 'Goofy.app' -type d -print -quit)
+          if [ -z "$app" ]; then
+            echo "::error::Archive did not contain Goofy.app"
+            exit 1
+          fi
+          cp -R "$app" build/export/Goofy.app
+          codesign --force --deep --sign - \
+            --entitlements goofy/goofy.entitlements \
+            --options runtime \
+            build/export/Goofy.app
+          codesign --verify --deep --strict --verbose=2 build/export/Goofy.app
+
+      - name: Notarize
+        if: steps.skip.outputs.exists != 'true' && steps.signing.outputs.notarize == 'true'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          keychain_password=$(cat "$RUNNER_TEMP/keychain-password")
+          security unlock-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+          key_dir="$RUNNER_TEMP/private_keys"
+          mkdir -p "$key_dir"
+          key_path="${key_dir}/AuthKey_${API_KEY_ID}.p8"
+          if printf '%s' "$API_KEY" | grep -q "BEGIN PRIVATE KEY"; then
+            printf '%s\n' "$API_KEY" > "$key_path"
+          else
+            printf '%s' "$API_KEY" | tr -d '[:space:]' | base64 -D > "$key_path"
+          fi
+          chmod 600 "$key_path"
+          export COPYFILE_DISABLE=1
+          (cd build/export && zip -r -y ../Goofy-notarize.zip Goofy.app)
+          xcrun notarytool submit build/Goofy-notarize.zip \
+            --key "$key_path" \
+            --key-id "$API_KEY_ID" \
+            --issuer "$API_ISSUER" \
+            --wait
+          xcrun stapler staple build/export/Goofy.app
+          rm -f "$key_path" build/Goofy-notarize.zip
+
+      - name: Zip Goofy.app
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          bash scripts/make_release_zip.sh \
+            build/export/Goofy.app \
+            "$VERSION" \
+            "build/Goofy-${VERSION}.zip"
+
+      - name: Upload workflow artifact
+        if: steps.skip.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Goofy-${{ steps.version.outputs.version }}
+          path: build/Goofy-${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.skip.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          zip_path="build/Goofy-${VERSION}.zip"
+          asset_name="Goofy-${VERSION}.zip"
+          case "$SIGNING" in
+            adhoc)
+              footer='**Signing: ad-hoc.** No Developer ID certificate was available. Gatekeeper may block the app. AppUpdater installs an update when the download code-signing authority matches the running app. An ad-hoc zip has no authority, so install this copy by hand. Add the Apple secrets in docs/RELEASE.md to publish a notarized build.'
+              ;;
+            developer-id)
+              if [ "$NOTARIZE" = "true" ]; then
+                footer='**Signing: Developer ID, notarized.**'
+              else
+                footer='**Signing: Developer ID, not notarized.** Gatekeeper may prompt on first launch. Add the notarytool secrets in docs/RELEASE.md to staple a ticket.'
+              fi
+              ;;
+            *)
+              echo "::error::Unexpected signing mode '${SIGNING}'."
+              exit 1
+              ;;
+          esac
+
+          create_args=(
+            "$VERSION"
+            "$zip_path"
+            --repo "$GITHUB_REPOSITORY"
+            --title "$VERSION"
+            --target "$GITHUB_SHA"
+            --latest
+            --generate-notes
+            --notes "$footer"
+          )
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "$zip_path" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          else
+            gh release create "${create_args[@]}"
+          fi
+
+          # gh creates a draft, uploads, then publishes. Confirm the state
+          # AppUpdater requires, and force application/zip if GitHub guessed
+          # a different content type.
+          gh release edit "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease=false \
+            --latest \
+            --title "$VERSION"
+
+          meta=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}")
+          draft=$(printf '%s' "$meta" | jq -r '.draft')
+          prerelease=$(printf '%s' "$meta" | jq -r '.prerelease')
+          tag=$(printf '%s' "$meta" | jq -r '.tag_name')
+          ctype=$(printf '%s' "$meta" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .content_type')
+          if [ "$draft" != "false" ] || [ "$prerelease" != "false" ] || [ "$tag" != "$VERSION" ]; then
+            echo "::error::Release ${VERSION} is draft=${draft} prerelease=${prerelease} tag=${tag}. AppUpdater ignores drafts, prereleases, and non-semver tags."
+            exit 1
+          fi
+          if [ "$ctype" != "application/zip" ]; then
+            echo "Asset content_type is '${ctype:-missing}'. Re-uploading as application/zip."
+            if [ -n "$ctype" ]; then
+              asset_id=$(printf '%s' "$meta" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .id')
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            fi
+            upload_url=$(printf '%s' "$meta" | jq -r '.upload_url')
+            upload_base="${upload_url%%\{*}"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/zip" \
+              --data-binary @"${zip_path}" \
+              "${upload_base}?name=${asset_name}"
+            ctype=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .content_type')
+          fi
+          if [ "$ctype" != "application/zip" ]; then
+            echo "::error::Asset ${asset_name} content_type is '${ctype}', not application/zip. AppUpdater will ignore it."
+            exit 1
+          fi
+          url=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          {
+            echo "### Goofy ${VERSION}"
+            echo ""
+            echo "- Release: ${url}"
+            echo "- Asset: \`${asset_name}\` (${ctype})"
+            echo "- Signing: ${SIGNING} (notarize: ${NOTARIZE})"
+            echo "- Project MARKETING_VERSION: ${PROJECT_VERSION}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove signing keychain
+        if: always() && steps.signing.outputs.mode == 'developer-id'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/keychain-password"
+          rm -rf "$RUNNER_TEMP/private_keys"

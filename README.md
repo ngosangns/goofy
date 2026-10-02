@@ -40,6 +40,23 @@ Then replace `/Applications/Goofy.app` with the built product (quit Goofy first)
 
 Upstream binary releases: [danielbuechele/goofy releases](https://github.com/danielbuechele/goofy/releases/latest).
 
+## Releases (this fork)
+
+Installed copies of this fork check [ngosangns/goofy releases](https://github.com/ngosangns/goofy/releases). AppUpdater looks for a published release (not a draft or prerelease) tagged `MAJOR.MINOR.PATCH` with an asset named `Goofy-<version>.zip`.
+
+```bash
+bash scripts/increment_build.sh   # prints: Build NNN, version X.Y.Z
+git add goofy.xcodeproj/project.pbxproj
+git commit -m "vX.Y.Z"
+git tag X.Y.Z
+git push origin HEAD
+git push origin X.Y.Z
+```
+
+Pushing the tag runs the Release workflow. A `vX.Y.Z` tag is accepted and published as `X.Y.Z`, which is the form AppUpdater parses. You can also run the workflow by hand (Actions → Release) and pass a version.
+
+With no Apple secrets, CI uploads an ad-hoc zip. Gatekeeper may block it. AppUpdater installs an update when both copies share a Developer ID authority, so an ad-hoc zip is a manual download. Secret names and the notarized path are in [docs/RELEASE.md](docs/RELEASE.md).
+
 ## Syncing upstream
 
 ```bash
