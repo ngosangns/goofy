@@ -8,6 +8,14 @@ user_invocable: true
 
 This skill builds, signs, notarizes, and releases a new version of the Goofy macOS app.
 
+## CI (ngosangns/goofy)
+
+This fork also publishes from GitHub Actions. See [docs/RELEASE.md](../../../docs/RELEASE.md). Pushing a `MAJOR.MINOR.PATCH` tag, or `v` plus that version, to `origin` runs `.github/workflows/release.yml`. The release asset is `Goofy-<version>.zip`, created with `zip -r -y`.
+
+The steps below are the local Developer ID path for a machine that already has the certificate and a `notarytool` keychain profile. CI reads repository secrets and does not use team `K5C6E7A2D6`. When those secrets are unset, CI still uploads an ad-hoc zip. AppUpdater installs a Developer ID build over a copy signed by the same Developer ID. An ad-hoc zip is for a manual install.
+
+Do not push tags or open pull requests against `danielbuechele/goofy`.
+
 ## Prerequisites
 
 - A "Developer ID Application" certificate must be in the keychain
