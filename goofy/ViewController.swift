@@ -40,12 +40,22 @@ class ViewController: NSViewController {
     private var isAuthenticated = false
     private var safariLoginController: SafariLoginController?
 
+    // Soft-reload / interaction tracking
+    private var lastUserInteraction = Date()
+    private var lastReloadDate = Date.distantPast
+    private let softReloadIdleSeconds: TimeInterval = 15 * 60
+    private let recentTypingSeconds: TimeInterval = 2 * 60
+    private var appearanceObserver: NSKeyValueObservation?
+    private var currentThreadKey: String?
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
         setupWebView()
         setupNotifications()
+        setupAppearanceObserver()
+        setupInteractionTracking()
         loadMessenger()
     }
 
@@ -61,6 +71,7 @@ class ViewController: NSViewController {
     deinit {
         reloadTimer?.invalidate()
         networkMonitor?.cancel()
+        appearanceObserver?.invalidate()
         NotificationCenter.default.removeObserver(self)
         webView.configuration.userContentController.removeScriptMessageHandler(
             forName: messageHandlerName, contentWorld: .defaultClient)
@@ -123,12 +134,8 @@ class ViewController: NSViewController {
 
         webView.allowsBackForwardNavigationGestures = true
 
-        // Set custom user agent to appear as Safari
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
-        let osVersionString =
-            "\(osVersion.majorVersion)_\(osVersion.minorVersion)_\(osVersion.patchVersion)"
-        webView.customUserAgent =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X \(osVersionString)) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        // Dynamic Safari user agent
+        webView.customUserAgent = Self.safariUserAgent()
 
         webView.pageZoom = zoomLevel
 
@@ -167,9 +174,61 @@ class ViewController: NSViewController {
         window.toolbar = toolbar
         window.toolbarStyle = .unified
 
-        // Set background color for window and titlebar
-        window.backgroundColor = NSColor(
-            red: 245 / 255, green: 245 / 255, blue: 245 / 255, alpha: 1.0)
+        // Match system window background (light/dark)
+        window.backgroundColor = NSColor.windowBackgroundColor
+        applyAppearanceToWindow()
+    }
+
+    // MARK: - Safari UA
+
+    static func safariUserAgent() -> String {
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        let osVersionString =
+            "\(osVersion.majorVersion)_\(osVersion.minorVersion)_\(osVersion.patchVersion)"
+        let safariVersion = safariShortVersion() ?? "17.0"
+        return
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X \(osVersionString)) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
+    }
+
+    static func safariShortVersion() -> String? {
+        let plistURL = URL(fileURLWithPath: "/Applications/Safari.app/Contents/Info.plist")
+        guard let dict = NSDictionary(contentsOf: plistURL) as? [String: Any],
+            let version = dict["CFBundleShortVersionString"] as? String
+        else { return nil }
+        return version
+    }
+
+    // MARK: - Appearance
+
+    private func setupAppearanceObserver() {
+        appearanceObserver = NSApp.observe(\NSApplication.effectiveAppearance, options: [.new]) {
+            [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.applyAppearanceToWindow()
+            }
+        }
+        applyAppearanceToWindow()
+    }
+
+    private func applyAppearanceToWindow() {
+        view.window?.backgroundColor = NSColor.windowBackgroundColor
+        view.appearance = NSApp.effectiveAppearance
+    }
+
+    // MARK: - Interaction tracking
+
+    private func setupInteractionTracking() {
+        NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) {
+            [weak self] event in
+            self?.lastUserInteraction = Date()
+            return event
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
 
     private func loadMessenger() {
@@ -221,42 +280,84 @@ class ViewController: NSViewController {
 
     private func timerFired() {
         if NSApplication.shared.isActive {
-            // App is in foreground - defer reload
             reloadPending = true
             print("Reload deferred - app is in foreground")
         } else {
-            // App is in background - reload now
-            performReload()
+            softReload(reason: "periodic-timer")
         }
     }
 
     @objc private func systemDidWake(_ notification: Notification) {
-        print("System woke from sleep - reloading")
-        performReload()
+        print("System woke from sleep - evaluating soft reload")
+        softReload(reason: "wake")
     }
 
     private func handleNetworkChange(_ path: NWPath) {
         let isConnected = path.status == .satisfied
-
-        // Reload when connection is restored after being disconnected
         if !wasNetworkConnected && isConnected {
-            print("Network connection restored - reloading")
-            performReload()
+            print("Network connection restored - evaluating soft reload")
+            softReload(reason: "network")
         }
-
         wasNetworkConnected = isConnected
     }
 
-    private func performReload() {
+    /// Soft-reload: only reload if idle ≥ 15 min OR page looks broken.
+    /// Never hard-reload while app is key and user typed within ~2 min.
+    private func softReload(reason: String) {
+        let idle = Date().timeIntervalSince(lastUserInteraction)
+        let recentlyTyped = idle < recentTypingSeconds
+        let isKey = view.window?.isKeyWindow == true && NSApp.isActive
+
+        if isKey && recentlyTyped {
+            print("Soft reload skipped (\(reason)): user recently active while key")
+            reloadPending = true
+            return
+        }
+
+        let pageBroken = isPageLikelyBroken()
+        let idleEnough = idle >= softReloadIdleSeconds
+
+        if pageBroken || idleEnough || reason == "periodic-timer" {
+            performReload(reason: reason)
+        } else {
+            print(
+                "Soft reload deferred (\(reason)): idle \(Int(idle))s < \(Int(softReloadIdleSeconds))s"
+            )
+            reloadPending = true
+        }
+    }
+
+    private func isPageLikelyBroken() -> Bool {
+        // Heuristic: blank URL or not on facebook messages
+        guard let url = webView.url else { return true }
+        let host = url.host ?? ""
+        if !host.contains("facebook.com") && !host.contains("messenger.com") {
+            return true
+        }
+        return false
+    }
+
+    private func performReload(reason: String = "manual") {
         reloadPending = false
+        lastReloadDate = Date()
         webView.reload()
-        print("Reload performed")
+        print("Reload performed (\(reason))")
     }
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
+        notifyAppState("background")
         if reloadPending {
-            performReload()
+            softReload(reason: "resign-pending")
         }
+    }
+
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        notifyAppState("foreground")
+    }
+
+    private func notifyAppState(_ state: String) {
+        let script = "window.__GOOFY && window.__GOOFY.setAppState && window.__GOOFY.setAppState(\"\(state)\");"
+        webView?.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
     }
 
     // MARK: - Window Actions (forwarded to window)
@@ -368,19 +469,30 @@ class ViewController: NSViewController {
             } else {
                 NSApp.dockTile.badgeLabel = nil
             }
+            NotificationCenter.default.post(
+                name: .goofyBadgeDidChange, object: nil, userInfo: ["count": count])
         }
     }
 
     // MARK: - Show Notification
 
     private func showNotification(title: String, body: String, threadKey: String) {
+        let mode = GoofySettings.notificationMode
+        if mode == .off { return }
+
+        // If already viewing this thread and window is key, skip enqueue entirely
+        if shouldSuppressBanner(for: threadKey) && mode == .banner {
+            return
+        }
+
         let content = UNMutableNotificationContent()
         content.title = title
-        content.body = body
-        content.sound = .default
+        content.body = GoofySettings.hidePreview ? "" : body
+        if mode == .banner {
+            content.sound = .default
+        }
         content.userInfo = ["threadKey": threadKey]
 
-        // Use threadKey as identifier to group/replace notifications from same thread
         let identifier = threadKey.replacingOccurrences(of: "/", with: "_")
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
 
@@ -389,6 +501,27 @@ class ViewController: NSViewController {
                 print("Failed to show notification: \(error)")
             }
         }
+    }
+
+    private func shouldSuppressBanner(for threadKey: String) -> Bool {
+        guard view.window?.isKeyWindow == true, NSApp.isActive else { return false }
+        guard let current = currentThreadKey, !current.isEmpty else { return false }
+        return threadKeysMatch(current, threadKey)
+    }
+
+    private func threadKeysMatch(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        // Compare path tails (/messages/t/ID)
+        let na = normalizeThreadKey(a)
+        let nb = normalizeThreadKey(b)
+        return !na.isEmpty && na == nb
+    }
+
+    private func normalizeThreadKey(_ key: String) -> String {
+        if let url = URL(string: key, relativeTo: URL(string: "https://www.facebook.com")) {
+            return url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        }
+        return key.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     // MARK: - Navigate to Thread
@@ -405,6 +538,72 @@ class ViewController: NSViewController {
         // Bring window to front
         NSApp.activate(ignoringOtherApps: true)
         view.window?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - Keyboard / prefs bridge
+
+    func jumpToThread(index: Int) {
+        let script = "window.__GOOFY && window.__GOOFY.jumpToThread && window.__GOOFY.jumpToThread(\(index));"
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
+    }
+
+    func prevThread() {
+        webView.evaluateJavaScript(
+            "window.__GOOFY && window.__GOOFY.prevThread && window.__GOOFY.prevThread();",
+            in: nil, in: .defaultClient) { _ in }
+    }
+
+    func nextThread() {
+        webView.evaluateJavaScript(
+            "window.__GOOFY && window.__GOOFY.nextThread && window.__GOOFY.nextThread();",
+            in: nil, in: .defaultClient) { _ in }
+    }
+
+    func applyChatOnlyPreference() {
+        let enabled = GoofySettings.chatOnly
+        let script =
+            "window.__GOOFY && window.__GOOFY.setChatOnly && window.__GOOFY.setChatOnly(\(enabled));"
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
+        // Also toggle class immediately in page world via injected style path
+        let pageScript =
+            "document.documentElement.classList.toggle('goofy-chat-only', \(enabled));"
+        webView.evaluateJavaScript(pageScript, in: nil, in: .page) { _ in }
+    }
+
+    func applyPrivacyPreferences() {
+        let typing = GoofySettings.blockTyping
+        let seen = GoofySettings.blockSeen
+        let script =
+            "window.__GOOFY && window.__GOOFY.applyPrivacyHooks && window.__GOOFY.applyPrivacyHooks(\(typing), \(seen));"
+        // Privacy hooks must run in page world to see page fetch
+        let pageScript = """
+            (function(blockTyping, blockSeen) {
+              if (!blockTyping && !blockSeen) return;
+              try {
+                if (window.__GOOFY_PRIVACY_FETCH__) return;
+                window.__GOOFY_PRIVACY_FETCH__ = true;
+                var originalFetch = window.fetch;
+                if (!originalFetch) return;
+                window.fetch = function() {
+                  try {
+                    var arg = arguments[0];
+                    var url = typeof arg === 'string' ? arg : (arg && arg.url);
+                    if (typeof url === 'string') {
+                      if (blockTyping && /typ|typing|comet_typing/i.test(url)) {
+                        return Promise.resolve(new Response('{}', { status: 200 }));
+                      }
+                      if (blockSeen && /mark_seen|delivery_receipt|read_receipt|\\/seen/i.test(url)) {
+                        return Promise.resolve(new Response('{}', { status: 200 }));
+                      }
+                    }
+                  } catch (e) {}
+                  return originalFetch.apply(this, arguments);
+                };
+              } catch (e) {}
+            })(\(typing), \(seen));
+            """
+        webView.evaluateJavaScript(pageScript, in: nil, in: .page) { _ in }
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
     }
 }
 
@@ -432,7 +631,17 @@ extension ViewController: WKScriptMessageHandler {
                 let notificationBody = body["body"] as? String,
                 let threadKey = body["threadKey"] as? String
             {
+                if let current = body["currentThreadKey"] as? String {
+                    currentThreadKey = current
+                }
                 showNotification(title: title, body: notificationBody, threadKey: threadKey)
+            }
+
+        case "currentThread":
+            if let threadKey = body["threadKey"] as? String {
+                currentThreadKey = threadKey
+            } else if body["threadKey"] is NSNull {
+                currentThreadKey = nil
             }
 
         case "log":
@@ -465,25 +674,73 @@ extension ViewController: WKNavigationDelegate {
             return
         }
 
-        // Allow facebook.com/messages and Facebook internal domains in the main webview
-        let host = url.host ?? ""
-        if host.contains("facebook.com") && url.path.hasPrefix("/messages") ||
-           host.contains("fbsbx.com") || host.contains("fbcdn.net") {
+        // Allow messages + media + call-related FB paths
+        if isAllowedInApp(url: url) {
             decisionHandler(.allow)
             return
         }
 
-        // Before login, silently cancel all other navigations (login redirects)
+        // While Safari login is active, don't cancel auth flows from main view
+        if safariLoginController != nil {
+            decisionHandler(.cancel)
+            return
+        }
+
+        // Before login, silently cancel other navigations (login redirects)
         if !isAuthenticated {
             decisionHandler(.cancel)
             return
         }
 
-        // After login, open non-messages URLs externally
+        // After login, unwrap tracking redirects then open externally
         if let scheme = url.scheme, ["http", "https"].contains(scheme) {
-            NSWorkspace.shared.open(url)
+            let unwrapped = Self.unwrapTrackingURL(url)
+            NSWorkspace.shared.open(unwrapped)
         }
         decisionHandler(.cancel)
+    }
+
+    private func isAllowedInApp(url: URL) -> Bool {
+        let host = url.host ?? ""
+        let path = url.path.lowercased()
+
+        if host.contains("fbsbx.com") || host.contains("fbcdn.net") {
+            return true
+        }
+        if host.contains("facebook.com") || host.contains("messenger.com") {
+            if path.hasPrefix("/messages") { return true }
+            // Calls / rooms / attachment helpers
+            if path.contains("/call") || path.contains("/rtc") || path.contains("/voip") {
+                return true
+            }
+            if path.hasPrefix("/video_call") || path.hasPrefix("/groupcall") {
+                return true
+            }
+            // Auth-ish while already in messages shell
+            if path.hasPrefix("/login") || path.hasPrefix("/checkpoint") {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Unwrap l.facebook.com/l.php?u= and similar tracking redirects.
+    static func unwrapTrackingURL(_ url: URL) -> URL {
+        let host = url.host ?? ""
+        guard host.contains("l.facebook.com") || host.contains("lm.facebook.com")
+            || host == "facebook.com" && url.path.hasPrefix("/l.php")
+            || host.hasSuffix(".facebook.com") && url.path.hasPrefix("/l.php")
+        else {
+            return url
+        }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let uParam = components.queryItems?.first(where: { $0.name == "u" })?.value,
+            let decoded = uParam.removingPercentEncoding,
+            let unwrapped = URL(string: decoded)
+        else {
+            return url
+        }
+        return unwrapped
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -499,6 +756,9 @@ extension ViewController: WKNavigationDelegate {
             DispatchQueue.main.async {
                 if authenticated {
                     self?.isAuthenticated = true
+                    self?.applyChatOnlyPreference()
+                    self?.applyPrivacyPreferences()
+                    self?.notifyAppState(NSApp.isActive ? "foreground" : "background")
                 } else {
                     print("[Goofy] Not authenticated, opening Safari login window")
                     self?.loginWithSafari(nil)
@@ -568,10 +828,11 @@ extension ViewController: WKUIDelegate {
     ) -> WKWebView? {
         if let url = navigationAction.request.url {
             if url.scheme == "blob" {
-                // Load in current webview so decidePolicyFor can handle it as .download
                 webView.load(navigationAction.request)
+            } else if isAllowedInApp(url: url) {
+                webView.load(URLRequest(url: url))
             } else {
-                NSWorkspace.shared.open(url)
+                NSWorkspace.shared.open(Self.unwrapTrackingURL(url))
             }
         }
         return nil
@@ -733,8 +994,21 @@ extension ViewController: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler:
             @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // Show notification even when app is in foreground
-        completionHandler([.banner, .sound])
+        let mode = GoofySettings.notificationMode
+        if mode == .off {
+            completionHandler([])
+            return
+        }
+        if mode == .badge {
+            completionHandler([.badge])
+            return
+        }
+        let threadKey = notification.request.content.userInfo["threadKey"] as? String
+        if let threadKey, shouldSuppressBanner(for: threadKey) {
+            completionHandler([])
+            return
+        }
+        completionHandler([.banner, .sound, .badge])
     }
 
     // Handle notification click

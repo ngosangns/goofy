@@ -22,3 +22,41 @@ h1.html-h1 {
 [role="navigation"] header {
     justify-content: flex-end !important;
 }
+
+/* --- Chat-only mode (toggled via .goofy-chat-only on <html>) --- */
+/* Best-effort: hide chrome outside messages without breaking list/composer */
+
+html.goofy-chat-only [role="banner"],
+html.goofy-chat-only [aria-label="Facebook"][role="navigation"],
+html.goofy-chat-only a[href="/"],
+html.goofy-chat-only a[href*="/watch"],
+html.goofy-chat-only a[href*="/reels"],
+html.goofy-chat-only a[href*="/marketplace"],
+html.goofy-chat-only a[href*="/gaming"],
+html.goofy-chat-only a[href*="/friends"],
+html.goofy-chat-only a[href*="/groups"],
+html.goofy-chat-only a[href="/notifications"],
+html.goofy-chat-only a[href*="/bookmarks"] {
+    /* Don't blanket-hide all anchors — only left rail / top chrome where safe */
+}
+
+/* Hide top Facebook chrome bars that aren't Messenger-specific */
+html.goofy-chat-only div[role="banner"] {
+    display: none !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+}
+
+/* Hide "More" / Feed-adjacent side panels when they appear outside messages nav */
+html.goofy-chat-only [data-pagelet="LeftRail"],
+html.goofy-chat-only [data-pagelet="RightRail"] {
+    display: none !important;
+}
+
+/* Soften marketplace / reels teasers if injected into messages shell */
+html.goofy-chat-only a[href*="facebook.com/reel"],
+html.goofy-chat-only a[href*="facebook.com/watch"],
+html.goofy-chat-only a[href*="facebook.com/marketplace"] {
+    display: none !important;
+}

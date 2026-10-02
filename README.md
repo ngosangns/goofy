@@ -1,33 +1,57 @@
-# Goofy, a desktop app for Facebook Messenger
+# Goofy (ngosangns fork)
 
-At its core, Goofy is a simple app that shows a web view of facebook.com/messages, but adding additional functionality you would expect from a native desktop app.
+Desktop Facebook Messenger for macOS — a lightweight native `WKWebView` shell (not Electron).
 
-## Features
+**This repository is a fork of [danielbuechele/goofy](https://github.com/danielbuechele/goofy)** maintained at [ngosangns/goofy](https://github.com/ngosangns/goofy).
 
-**Native Notifications**  
-Receive macOS notifications when new messages arrive while the app is running. Click a notification to jump directly to that conversation. Note: Notifications only work when the Messenger app is open.
+Display name and bundle id stay **`Goofy` / `cc.buechele.Goofy`** so replacing `/Applications/Goofy.app` keeps Dock identity, cookies, and preferences compatible with upstream installs.
 
-**Badge Counter**  
-See your unread message count displayed on the Messenger app icon in your Dock, just like a native app. The badge updates while the app is running.
+See **[PLAN.md](./PLAN.md)** for the optimization roadmap and checklist.
 
-## Installation
+## Features vs upstream
 
-Just download the latest version from the [releases page](https://github.com/danielbuechele/goofy/releases/latest), unzip it and move it to your Applications folder.
+Everything upstream has, plus (this fork):
+
+| Area | Fork additions |
+|------|----------------|
+| Perf | Debounced badge/message observers; pause work when app is backgrounded; soft-reload on wake/network (skips if you were just typing); dynamic Safari user-agent; system light/dark window chrome |
+| Notifications | Suppress banner when the window is key on the same thread; modes Banner / Badge-only / Off; optional hide message preview |
+| Keyboard | `⌘1`–`⌘9` jump conversations; `⌘[` / `⌘]` previous/next |
+| Window | Always on Top; menu bar status item with unread count; `⌘⇧Y` show/hide; optional Hide Dock (quit from menu bar) |
+| Focus / privacy | Chat-only CSS mode; unwrap `l.facebook.com` tracking redirects; optional block typing / seen (off by default, experimental) |
+| Updates | Auto-updater points at **ngosangns/goofy** (not upstream), so upstream releases do not overwrite this fork |
+
+## Installation (this fork)
+
+Build from source (Release) or copy a Release build to `/Applications/Goofy.app`.
+
+```bash
+xcodebuild -project goofy.xcodeproj -scheme goofy -configuration Release \
+  -derivedDataPath /tmp/goofy-build clean build \
+  CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES
+```
+
+Then replace `/Applications/Goofy.app` with the built product (quit Goofy first).
+
+Upstream binary releases: [danielbuechele/goofy releases](https://github.com/danielbuechele/goofy/releases/latest).
+
+## Syncing upstream
+
+```bash
+git fetch upstream
+git merge upstream/main
+```
 
 ## Questions
 
-### How do I report bugs?
-Please use the [Issues section](https://github.com/danielbuechele/goofy/issues) on the GitHub repository to report any bugs or request features.
-
 ### Is Goofy an Electron app?
-No, Goofy is built using macOS's native WebView component via Swift and SwiftUI. This results in a much smaller app size and lower memory usage compared to Electron-based apps.
+No — native macOS WebKit via Swift. Smaller and lighter than Electron wrappers.
 
 ### Can Goofy access my Facebook data?
-Goofy works by injecting a small JavaScript snippet into messenger.com to enable notifications and badge counting. The source code is open and available for review on GitHub, so you can verify that no data is being collected or transmitted elsewhere.
+It injects a small script for notifications and badge counting. Source is open; no telemetry is collected. Settings live in `UserDefaults` under `goofy.*` keys.
 
-### I don't like the icon. Can I change it?
-Yes! [macosicons.com](https://macosicons.com/#/messenger) has a great selection of alternative Messenger icons. You can replace the app icon by right-clicking on the Goofy app in Finder, selecting "Get Info", and dragging your preferred icon image onto the existing icon in the top-left.
+### Hide Dock icon
+Enable **Goofy → Hide Dock Icon** (also turns on the menu bar icon if needed). Quit from the status menu or **Quit Goofy**.
 
-## Follow for Updates
-
-Follow [Daniel Büchele on Threads](https://www.threads.com/@danielbuechele) for updates and announcements about Goofy.
+### Block typing / seen
+Optional and brittle (Facebook DOM/API changes often). Default **off**. Use at your own risk.
