@@ -43,10 +43,13 @@ class ViewController: NSViewController {
     // Soft-reload / interaction tracking
     private var lastUserInteraction = Date()
     private var lastReloadDate = Date.distantPast
-    private let softReloadIdleSeconds: TimeInterval = 15 * 60
+    private let softReloadIdleSeconds: TimeInterval = 30 * 60
     private let recentTypingSeconds: TimeInterval = 2 * 60
     private var appearanceObserver: NSKeyValueObservation?
     private var currentThreadKey: String?
+    private var networkReloadWorkItem: DispatchWorkItem?
+    private var windowVisible = true
+    private var interactionMonitor: Any?
 
     // MARK: - Lifecycle
 
@@ -71,7 +74,11 @@ class ViewController: NSViewController {
     deinit {
         reloadTimer?.invalidate()
         networkMonitor?.cancel()
+        networkReloadWorkItem?.cancel()
         appearanceObserver?.invalidate()
+        if let interactionMonitor {
+            NSEvent.removeMonitor(interactionMonitor)
+        }
         NotificationCenter.default.removeObserver(self)
         webView.configuration.userContentController.removeScriptMessageHandler(
             forName: messageHandlerName, contentWorld: .defaultClient)
@@ -81,7 +88,9 @@ class ViewController: NSViewController {
 
     private func setupWebView() {
         let configuration = WKWebViewConfiguration()
+        #if DEBUG
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        #endif
 
         let userContentController = WKUserContentController()
 
@@ -138,6 +147,19 @@ class ViewController: NSViewController {
         webView.customUserAgent = Self.safariUserAgent()
 
         webView.pageZoom = zoomLevel
+
+        #if DEBUG
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = true
+        }
+        #else
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = false
+        }
+        #endif
+
+        // Avoid an extra opaque layer behind WebKit content where possible.
+        webView.setValue(false, forKey: "drawsBackground")
 
         view.addSubview(webView)
 
@@ -218,8 +240,9 @@ class ViewController: NSViewController {
     // MARK: - Interaction tracking
 
     private func setupInteractionTracking() {
-        NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) {
-            [weak self] event in
+        interactionMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
             self?.lastUserInteraction = Date()
             return event
         }
@@ -295,14 +318,20 @@ class ViewController: NSViewController {
     private func handleNetworkChange(_ path: NWPath) {
         let isConnected = path.status == .satisfied
         if !wasNetworkConnected && isConnected {
-            print("Network connection restored - evaluating soft reload")
-            softReload(reason: "network")
+            // Debounce NWPathMonitor chatter (flaps on sleep/VPN).
+            networkReloadWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                print("Network connection restored - evaluating soft reload")
+                self?.softReload(reason: "network")
+            }
+            networkReloadWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
         }
         wasNetworkConnected = isConnected
     }
 
-    /// Soft-reload: only reload if idle ≥ 15 min OR page looks broken.
-    /// Never hard-reload while app is key and user typed within ~2 min.
+    /// Soft-reload: only reload if idle ≥ 30 min OR page looks broken.
+    /// Never reload while key + recently typed. Wake/network never force-reload.
     private func softReload(reason: String) {
         let idle = Date().timeIntervalSince(lastUserInteraction)
         let recentlyTyped = idle < recentTypingSeconds
@@ -314,10 +343,18 @@ class ViewController: NSViewController {
             return
         }
 
+        // Avoid reload storms: at most once per 10 minutes unless page looks broken.
+        let sinceLast = Date().timeIntervalSince(lastReloadDate)
         let pageBroken = isPageLikelyBroken()
-        let idleEnough = idle >= softReloadIdleSeconds
+        if !pageBroken && sinceLast < 10 * 60 {
+            print("Soft reload skipped (\(reason)): reloaded \(Int(sinceLast))s ago")
+            reloadPending = true
+            return
+        }
 
-        if pageBroken || idleEnough || reason == "periodic-timer" {
+        let idleEnough = idle >= softReloadIdleSeconds
+        // periodic-timer only reloads when actually idle or broken — never force.
+        if pageBroken || idleEnough {
             performReload(reason: reason)
         } else {
             print(
@@ -352,12 +389,27 @@ class ViewController: NSViewController {
     }
 
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
-        notifyAppState("foreground")
+        if windowVisible {
+            notifyAppState("foreground")
+        }
     }
 
     private func notifyAppState(_ state: String) {
+        guard webView != nil else { return }
         let script = "window.__GOOFY && window.__GOOFY.setAppState && window.__GOOFY.setAppState(\"\(state)\");"
-        webView?.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
+        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
+    }
+
+    /// Pause/resume JS observers when the main window is ordered out/in.
+    func notifyWindowVisibility(_ visible: Bool) {
+        windowVisible = visible
+        if visible {
+            if NSApp.isActive {
+                notifyAppState("foreground")
+            }
+        } else {
+            notifyAppState("background")
+        }
     }
 
     // MARK: - Window Actions (forwarded to window)
@@ -559,52 +611,6 @@ class ViewController: NSViewController {
             in: nil, in: .defaultClient) { _ in }
     }
 
-    func applyChatOnlyPreference() {
-        let enabled = GoofySettings.chatOnly
-        let script =
-            "window.__GOOFY && window.__GOOFY.setChatOnly && window.__GOOFY.setChatOnly(\(enabled));"
-        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
-        // Also toggle class immediately in page world via injected style path
-        let pageScript =
-            "document.documentElement.classList.toggle('goofy-chat-only', \(enabled));"
-        webView.evaluateJavaScript(pageScript, in: nil, in: .page) { _ in }
-    }
-
-    func applyPrivacyPreferences() {
-        let typing = GoofySettings.blockTyping
-        let seen = GoofySettings.blockSeen
-        let script =
-            "window.__GOOFY && window.__GOOFY.applyPrivacyHooks && window.__GOOFY.applyPrivacyHooks(\(typing), \(seen));"
-        // Privacy hooks must run in page world to see page fetch
-        let pageScript = """
-            (function(blockTyping, blockSeen) {
-              if (!blockTyping && !blockSeen) return;
-              try {
-                if (window.__GOOFY_PRIVACY_FETCH__) return;
-                window.__GOOFY_PRIVACY_FETCH__ = true;
-                var originalFetch = window.fetch;
-                if (!originalFetch) return;
-                window.fetch = function() {
-                  try {
-                    var arg = arguments[0];
-                    var url = typeof arg === 'string' ? arg : (arg && arg.url);
-                    if (typeof url === 'string') {
-                      if (blockTyping && /typ|typing|comet_typing/i.test(url)) {
-                        return Promise.resolve(new Response('{}', { status: 200 }));
-                      }
-                      if (blockSeen && /mark_seen|delivery_receipt|read_receipt|\\/seen/i.test(url)) {
-                        return Promise.resolve(new Response('{}', { status: 200 }));
-                      }
-                    }
-                  } catch (e) {}
-                  return originalFetch.apply(this, arguments);
-                };
-              } catch (e) {}
-            })(\(typing), \(seen));
-            """
-        webView.evaluateJavaScript(pageScript, in: nil, in: .page) { _ in }
-        webView.evaluateJavaScript(script, in: nil, in: .defaultClient) { _ in }
-    }
 }
 
 // MARK: - WKScriptMessageHandler
@@ -756,9 +762,8 @@ extension ViewController: WKNavigationDelegate {
             DispatchQueue.main.async {
                 if authenticated {
                     self?.isAuthenticated = true
-                    self?.applyChatOnlyPreference()
-                    self?.applyPrivacyPreferences()
-                    self?.notifyAppState(NSApp.isActive ? "foreground" : "background")
+                    let foreground = NSApp.isActive && (self?.windowVisible ?? true)
+                    self?.notifyAppState(foreground ? "foreground" : "background")
                 } else {
                     print("[Goofy] Not authenticated, opening Safari login window")
                     self?.loginWithSafari(nil)

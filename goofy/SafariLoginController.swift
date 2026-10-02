@@ -24,7 +24,9 @@ class SafariLoginController: NSObject, WKNavigationDelegate, WKUIDelegate {
         onComplete = completion
 
         let configuration = WKWebViewConfiguration()
+        #if DEBUG
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        #endif
 
         // Use the same Safari user agent
         let webView = WKWebView(frame: .zero, configuration: configuration)

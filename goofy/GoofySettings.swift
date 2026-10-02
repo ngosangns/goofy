@@ -3,6 +3,7 @@
 //  goofy
 //
 //  UserDefaults-backed preferences for the ngosangns fork.
+//  Speed-first: only settings that are cheap or needed for core messaging.
 //
 
 import Foundation
@@ -12,12 +13,7 @@ enum GoofySettings {
     enum Key {
         static let notificationMode = "goofy.notificationMode"
         static let hidePreview = "goofy.hidePreview"
-        static let alwaysOnTop = "goofy.alwaysOnTop"
         static let menuBarEnabled = "goofy.menuBarEnabled"
-        static let hideDock = "goofy.hideDock"
-        static let chatOnly = "goofy.chatOnly"
-        static let blockTyping = "goofy.blockTyping"
-        static let blockSeen = "goofy.blockSeen"
     }
 
     enum NotificationMode: String, CaseIterable {
@@ -47,36 +43,12 @@ enum GoofySettings {
         set { UserDefaults.standard.set(newValue, forKey: Key.hidePreview) }
     }
 
-    static var alwaysOnTop: Bool {
-        get { UserDefaults.standard.bool(forKey: Key.alwaysOnTop) }
-        set { UserDefaults.standard.set(newValue, forKey: Key.alwaysOnTop) }
-    }
-
+    /// Default OFF — status item is pure UX and adds badge-update work on the hot path.
     static var menuBarEnabled: Bool {
         get {
-            if UserDefaults.standard.object(forKey: Key.menuBarEnabled) == nil { return true }
+            if UserDefaults.standard.object(forKey: Key.menuBarEnabled) == nil { return false }
             return UserDefaults.standard.bool(forKey: Key.menuBarEnabled)
         }
         set { UserDefaults.standard.set(newValue, forKey: Key.menuBarEnabled) }
-    }
-
-    static var hideDock: Bool {
-        get { UserDefaults.standard.bool(forKey: Key.hideDock) }
-        set { UserDefaults.standard.set(newValue, forKey: Key.hideDock) }
-    }
-
-    static var chatOnly: Bool {
-        get { UserDefaults.standard.bool(forKey: Key.chatOnly) }
-        set { UserDefaults.standard.set(newValue, forKey: Key.chatOnly) }
-    }
-
-    static var blockTyping: Bool {
-        get { UserDefaults.standard.bool(forKey: Key.blockTyping) }
-        set { UserDefaults.standard.set(newValue, forKey: Key.blockTyping) }
-    }
-
-    static var blockSeen: Bool {
-        get { UserDefaults.standard.bool(forKey: Key.blockSeen) }
-        set { UserDefaults.standard.set(newValue, forKey: Key.blockSeen) }
     }
 }

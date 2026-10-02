@@ -3,6 +3,8 @@
 //  goofy
 //
 //  Created by Daniel Büchele on 02/01/2026.
+//  Speed-trim: no global hotkeys, no Always-on-Top / Hide Dock / chat-only /
+//  typing-seen hooks. Menu bar opt-in (default off). AppUpdater delayed.
 //
 
 import AppUpdater
@@ -20,40 +22,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private var cancellables = Set<AnyCancellable>()
     private var statusItem: NSStatusItem?
-    private var globalHotkeyMonitor: Any?
-    private var localHotkeyMonitor: Any?
-    private weak var preferencesWindow: NSWindow?
+    private var updateCheckWorkItem: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let window = NSApplication.shared.windows.first {
             window.delegate = self
             window.setFrameAutosaveName("MainWindow")
-            applyAlwaysOnTop(GoofySettings.alwaysOnTop, window: window)
         }
 
         Self.appUpdater.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
-                print("[AutoUpdater] State changed: \(state)")
                 if case .downloaded(let release, _, let bundle) = state {
                     self?.showUpdateAlert(version: release.tagName.description, bundle: bundle)
                 }
             }
             .store(in: &cancellables)
 
-        Self.appUpdater.check()
-
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) {
-            granted, error in
-            if let error = error {
-                print("Notification authorization error: \(error)")
-            }
+        // Delay auto-update network/CPU off the launch hot path.
+        let work = DispatchWorkItem {
+            Self.appUpdater.check()
         }
+        updateCheckWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300, execute: work)
+
+        // Notification permission is requested once in ViewController.setupNotifications.
 
         setupProgrammaticMenus()
-        applyDockVisibility()
         updateStatusItem()
-        registerHotkeys()
 
         NotificationCenter.default.addObserver(
             self,
@@ -64,12 +60,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let globalHotkeyMonitor {
-            NSEvent.removeMonitor(globalHotkeyMonitor)
-        }
-        if let localHotkeyMonitor {
-            NSEvent.removeMonitor(localHotkeyMonitor)
-        }
+        updateCheckWorkItem?.cancel()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -78,7 +69,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
+        // Tell web content to pause observers while window is hidden.
+        viewController()?.notifyWindowVisibility(false)
         return false
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        viewController()?.notifyWindowVisibility(true)
     }
 
     func windowWillEnterFullScreen(_ notification: Notification) {
@@ -113,18 +110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        if GoofySettings.hideDock {
-            NSApp.setActivationPolicy(.regular)
-            // Keep hideDock preference; temporarily show in Dock while visible if needed —
-            // actually Caprine-style keeps accessory always. Just front the window.
-            NSApp.setActivationPolicy(.accessory)
-        }
         for window in NSApplication.shared.windows {
             if window.isMiniaturized {
                 window.deminiaturize(self)
             }
             window.makeKeyAndOrderFront(self)
         }
+        viewController()?.notifyWindowVisibility(true)
     }
 
     @objc func toggleMainWindow() {
@@ -134,25 +126,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if window.isVisible && NSApp.isActive {
             window.orderOut(nil)
+            viewController()?.notifyWindowVisibility(false)
         } else {
             showMainWindow()
         }
     }
 
-    private func applyAlwaysOnTop(_ enabled: Bool, window: NSWindow? = nil) {
-        let win = window ?? mainWindow()
-        win?.level = enabled ? .floating : .normal
-    }
-
-    private func applyDockVisibility() {
-        if GoofySettings.hideDock {
-            NSApp.setActivationPolicy(.accessory)
-        } else {
-            NSApp.setActivationPolicy(.regular)
-        }
-    }
-
-    // MARK: - Status item
+    // MARK: - Status item (opt-in, default off)
 
     private func updateStatusItem() {
         if GoofySettings.menuBarEnabled {
@@ -179,34 +159,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func statusItemClicked(_ sender: Any?) {
-        // Menu handles right-click via statusItem.menu; left click also shows menu by default.
-        // Extra: if we want toggle on left without menu delay, handle here.
         toggleMainWindow()
     }
 
     private func buildStatusMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(withTitle: "Show Goofy", action: #selector(showMainWindow), keyEquivalent: "")
-        menu.addItem(NSMenuItem.separator())
-
-        let always = NSMenuItem(
-            title: "Always on Top", action: #selector(toggleAlwaysOnTop(_:)), keyEquivalent: "")
-        always.state = GoofySettings.alwaysOnTop ? .on : .off
-        always.target = self
-        menu.addItem(always)
-
-        let chatOnly = NSMenuItem(
-            title: "Chat Only Mode", action: #selector(toggleChatOnly(_:)), keyEquivalent: "")
-        chatOnly.state = GoofySettings.chatOnly ? .on : .off
-        chatOnly.target = self
-        menu.addItem(chatOnly)
-
-        let hideDock = NSMenuItem(
-            title: "Hide Dock Icon", action: #selector(toggleHideDock(_:)), keyEquivalent: "")
-        hideDock.state = GoofySettings.hideDock ? .on : .off
-        hideDock.target = self
-        menu.addItem(hideDock)
-
         menu.addItem(NSMenuItem.separator())
         let prefs = NSMenuItem(
             title: "Preferences…", action: #selector(showPreferences(_:)), keyEquivalent: ",")
@@ -221,6 +179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func badgeDidChange(_ notification: Notification) {
+        guard statusItem != nil else { return }
         let count = notification.userInfo?["count"] as? Int ?? 0
         guard let button = statusItem?.button else { return }
         if count > 0 {
@@ -230,40 +189,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // MARK: - Hotkeys ⌘⇧Y
-
-    private func registerHotkeys() {
-        localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if self?.isToggleHotkey(event) == true {
-                self?.toggleMainWindow()
-                return nil
-            }
-            return event
-        }
-        globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if self?.isToggleHotkey(event) == true {
-                DispatchQueue.main.async {
-                    self?.toggleMainWindow()
-                }
-            }
-        }
-    }
-
-    private func isToggleHotkey(_ event: NSEvent) -> Bool {
-        // ⌘⇧Y
-        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        return flags == [.command, .shift]
-            && (event.charactersIgnoringModifiers?.lowercased() == "y")
-    }
-
     // MARK: - Programmatic menus
 
     private func setupProgrammaticMenus() {
         guard let mainMenu = NSApp.mainMenu else { return }
 
-        // Find or create Goofy app menu (first menu)
         if let appMenu = mainMenu.items.first?.submenu {
-            // Insert Preferences if missing
             if appMenu.item(withTitle: "Preferences…") == nil
                 && appMenu.item(withTitle: "Settings…") == nil
             {
@@ -271,38 +202,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     title: "Preferences…", action: #selector(showPreferences(_:)),
                     keyEquivalent: ",")
                 prefs.target = self
-                // Insert after About if present, else at top
                 let insertIndex = min(1, appMenu.items.count)
                 appMenu.insertItem(prefs, at: insertIndex)
                 appMenu.insertItem(NSMenuItem.separator(), at: insertIndex + 1)
             }
         }
 
-        // Window menu: Always on Top
-        if let windowMenuItem = mainMenu.items.first(where: { $0.title == "Window" }),
-            let windowMenu = windowMenuItem.submenu
-        {
-            if windowMenu.item(withTitle: "Always on Top") == nil {
-                let item = NSMenuItem(
-                    title: "Always on Top", action: #selector(toggleAlwaysOnTop(_:)),
-                    keyEquivalent: "")
-                item.target = self
-                item.state = GoofySettings.alwaysOnTop ? .on : .off
-                windowMenu.insertItem(item, at: 0)
-                windowMenu.insertItem(NSMenuItem.separator(), at: 1)
-            }
-        }
-
-        // Goofy / View extras: notification + privacy toggles + thread jump
         let extras = NSMenu(title: "Goofy")
-        extras.addItem(makeCheckItem("Always on Top", #selector(toggleAlwaysOnTop(_:)), GoofySettings.alwaysOnTop))
-        extras.addItem(makeCheckItem("Menu Bar Icon", #selector(toggleMenuBar(_:)), GoofySettings.menuBarEnabled))
-        extras.addItem(makeCheckItem("Hide Dock Icon", #selector(toggleHideDock(_:)), GoofySettings.hideDock))
-        extras.addItem(makeCheckItem("Chat Only Mode", #selector(toggleChatOnly(_:)), GoofySettings.chatOnly))
-        extras.addItem(NSMenuItem.separator())
-        extras.addItem(makeCheckItem("Hide Notification Preview", #selector(toggleHidePreview(_:)), GoofySettings.hidePreview))
-        extras.addItem(makeCheckItem("Block Typing Indicator", #selector(toggleBlockTyping(_:)), GoofySettings.blockTyping))
-        extras.addItem(makeCheckItem("Block Seen Receipts", #selector(toggleBlockSeen(_:)), GoofySettings.blockSeen))
+        extras.addItem(
+            makeCheckItem("Menu Bar Icon", #selector(toggleMenuBar(_:)), GoofySettings.menuBarEnabled))
+        extras.addItem(
+            makeCheckItem(
+                "Hide Notification Preview", #selector(toggleHidePreview(_:)),
+                GoofySettings.hidePreview))
         extras.addItem(NSMenuItem.separator())
 
         let notiMenu = NSMenu(title: "Notifications")
@@ -323,7 +235,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         extras.addItem(
             withTitle: "Preferences…", action: #selector(showPreferences(_:)), keyEquivalent: "")
 
-        // Thread navigation
         let nav = NSMenu(title: "Conversation")
         for i in 1...9 {
             let item = NSMenuItem(
@@ -347,7 +258,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         next.target = self
         nav.addItem(next)
 
-        // Insert Goofy menu before Help if present
         let goofyItem = NSMenuItem(title: "Goofy", action: nil, keyEquivalent: "")
         goofyItem.submenu = extras
         let convItem = NSMenuItem(title: "Conversation", action: nil, keyEquivalent: "")
@@ -374,20 +284,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let menu else { return }
             for item in menu.items {
                 switch item.title {
-                case "Always on Top":
-                    item.state = GoofySettings.alwaysOnTop ? .on : .off
                 case "Menu Bar Icon":
                     item.state = GoofySettings.menuBarEnabled ? .on : .off
-                case "Hide Dock Icon":
-                    item.state = GoofySettings.hideDock ? .on : .off
-                case "Chat Only Mode":
-                    item.state = GoofySettings.chatOnly ? .on : .off
                 case "Hide Notification Preview":
                     item.state = GoofySettings.hidePreview ? .on : .off
-                case "Block Typing Indicator":
-                    item.state = GoofySettings.blockTyping ? .on : .off
-                case "Block Seen Receipts":
-                    item.state = GoofySettings.blockSeen ? .on : .off
                 case "Banner", "Badge only", "Off":
                     if let raw = item.representedObject as? String {
                         item.state = GoofySettings.notificationMode.rawValue == raw ? .on : .off
@@ -399,16 +299,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         walk(NSApp.mainMenu)
-        statusItem?.menu = buildStatusMenu()
+        if GoofySettings.menuBarEnabled {
+            statusItem?.menu = buildStatusMenu()
+        }
     }
 
     // MARK: - Actions
-
-    @objc func toggleAlwaysOnTop(_ sender: Any?) {
-        GoofySettings.alwaysOnTop.toggle()
-        applyAlwaysOnTop(GoofySettings.alwaysOnTop)
-        refreshCheckStates()
-    }
 
     @objc func toggleMenuBar(_ sender: Any?) {
         GoofySettings.menuBarEnabled.toggle()
@@ -416,39 +312,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshCheckStates()
     }
 
-    @objc func toggleHideDock(_ sender: Any?) {
-        GoofySettings.hideDock.toggle()
-        applyDockVisibility()
-        refreshCheckStates()
-        if GoofySettings.hideDock {
-            // Ensure status item exists so user can quit / show
-            if !GoofySettings.menuBarEnabled {
-                GoofySettings.menuBarEnabled = true
-                updateStatusItem()
-            }
-        }
-    }
-
-    @objc func toggleChatOnly(_ sender: Any?) {
-        GoofySettings.chatOnly.toggle()
-        viewController()?.applyChatOnlyPreference()
-        refreshCheckStates()
-    }
-
     @objc func toggleHidePreview(_ sender: Any?) {
         GoofySettings.hidePreview.toggle()
-        refreshCheckStates()
-    }
-
-    @objc func toggleBlockTyping(_ sender: Any?) {
-        GoofySettings.blockTyping.toggle()
-        viewController()?.applyPrivacyPreferences()
-        refreshCheckStates()
-    }
-
-    @objc func toggleBlockSeen(_ sender: Any?) {
-        GoofySettings.blockSeen.toggle()
-        viewController()?.applyPrivacyPreferences()
         refreshCheckStates()
     }
 
@@ -473,15 +338,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func showPreferences(_ sender: Any?) {
-        if let preferencesWindow, preferencesWindow.isVisible {
-            preferencesWindow.makeKeyAndOrderFront(nil)
-            return
-        }
-
         let alert = NSAlert()
         alert.messageText = "Goofy Preferences"
         alert.informativeText =
-            "Notification mode, privacy, and window options. Changes apply immediately."
+            "Notification options. Menu bar icon is off by default to save idle work."
         alert.alertStyle = .informational
 
         let stack = NSStackView()
@@ -511,12 +371,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let toggles: [(String, Bool, Selector)] = [
             ("Hide message preview", GoofySettings.hidePreview, #selector(toggleHidePreview(_:))),
-            ("Always on Top", GoofySettings.alwaysOnTop, #selector(toggleAlwaysOnTop(_:))),
             ("Menu Bar Icon", GoofySettings.menuBarEnabled, #selector(toggleMenuBar(_:))),
-            ("Hide Dock Icon", GoofySettings.hideDock, #selector(toggleHideDock(_:))),
-            ("Chat Only Mode", GoofySettings.chatOnly, #selector(toggleChatOnly(_:))),
-            ("Block Typing Indicator", GoofySettings.blockTyping, #selector(toggleBlockTyping(_:))),
-            ("Block Seen Receipts", GoofySettings.blockSeen, #selector(toggleBlockSeen(_:))),
         ]
 
         for (title, on, action) in toggles {
@@ -525,15 +380,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stack.addArrangedSubview(button)
         }
 
-        let note = NSTextField(
-            wrappingLabelWithString:
-                "Hide Dock: quit from menu bar or Goofy ▸ Quit. Block typing/seen is experimental and may break."
-        )
-        note.font = NSFont.systemFont(ofSize: 11)
-        note.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(note)
-
-        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 260)
+        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 140)
         alert.accessoryView = stack
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -570,6 +417,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @IBAction func checkForUpdates(_ sender: Any?) {
+        updateCheckWorkItem?.cancel()
         Self.appUpdater.check(
             success: {
                 DispatchQueue.main.async {

@@ -11,6 +11,9 @@ window.__GOOFY = {
   _debounceTimers: {},
   _observersPaused: false,
   _activeObservers: [],
+  _lastCurrentThreadKey: undefined,
+  _lastBadgeCount: -1,
+  _debug: false,
 
   postToNative: function (message) {
     if (
@@ -30,11 +33,7 @@ window.__GOOFY = {
       if (node.nodeType === Node.TEXT_NODE) {
         result += node.textContent;
       } else if (node.nodeType === Node.ELEMENT_NODE) {
-        // Skip screen-reader-only elements
         if (node.classList && node.classList.contains("x1i1rx1s")) continue;
-        if (node.getAttribute && node.getAttribute("aria-hidden") === "true" && node.tagName !== "IMG") {
-          // still allow images with alts
-        }
         if (node.tagName === "IMG") {
           const alt = node.alt || "";
           result += this.ALT_TEXT_TO_EMOJI[alt] || alt;
@@ -46,11 +45,10 @@ window.__GOOFY = {
     return result;
   },
 
+  // Local console only — never bridge to native (was a hot-path IPC storm).
   log: function (message) {
-    const timestamp = new Date().toISOString();
-    const logEntry = `[${timestamp}] ${message}`;
-    console.log(`[Goofy] ${logEntry}`);
-    this.postToNative({ type: "log", message: logEntry });
+    if (!this._debug) return;
+    console.log(`[Goofy] ${message}`);
   },
 
   debounce: function (key, fn, waitMs) {
@@ -63,6 +61,12 @@ window.__GOOFY = {
     }, waitMs);
   },
 
+  debounceMs: function () {
+    // Longer debounce while backgrounded (observers should already be paused;
+    // this covers residual/resume catch-up).
+    return this.appState === "background" ? 1200 : 400;
+  },
+
   // --- Resilient selectors (aria/role first, class-hash fallback) ---
 
   getThreadLinks: function () {
@@ -72,12 +76,10 @@ window.__GOOFY = {
   },
 
   getThreadName: function (anchor) {
-    // Prefer aria-label on the row/link, then span with visible text
     const aria =
       anchor.getAttribute("aria-label") ||
       anchor.closest('[role="row"]')?.getAttribute("aria-label");
     if (aria) {
-      // aria-label often includes snippet; take first line-ish chunk
       const name = aria.split(/[,.]/)[0]?.trim();
       if (name && name.length < 80) return name;
     }
@@ -89,8 +91,9 @@ window.__GOOFY = {
   },
 
   getSnippetElement: function (anchor) {
-    // Prefer last text-ish span under the link (preview line)
-    const candidates = anchor.querySelectorAll('div[dir="auto"] span, span[dir="auto"], div.xi81zsa span');
+    const candidates = anchor.querySelectorAll(
+      'div[dir="auto"] span, span[dir="auto"], div.xi81zsa span',
+    );
     if (candidates.length > 0) {
       return candidates[candidates.length - 1];
     }
@@ -98,7 +101,7 @@ window.__GOOFY = {
   },
 
   isUnreadThread: function (anchor) {
-    // Unread indicator: role=status, or aria-label containing unread, or legacy class
+    // Prefer cheap DOM attribute checks — avoid getComputedStyle (forces layout).
     if (
       anchor.querySelector(
         '[role="button"] [aria-label*="unread" i], [role="button"] [aria-label*="Unread"], [role="status"]',
@@ -107,13 +110,6 @@ window.__GOOFY = {
       return true;
     }
     if (anchor.querySelector('[role="button"] .x1spa7qu')) return true;
-    // Bold/strong weight on name often means unread
-    const nameEl =
-      anchor.querySelector('span[dir="auto"]') || anchor.querySelector("span.xlyipyv");
-    if (nameEl) {
-      const weight = parseInt(getComputedStyle(nameEl).fontWeight, 10);
-      if (weight >= 600) return true;
-    }
     return false;
   },
 
@@ -135,7 +131,7 @@ window.__GOOFY = {
       subtree = true,
       childList = true,
       characterData = false,
-      retryInterval = 3000,
+      retryInterval = 5000,
       onSetup = null,
       onRemove = null,
     } = options;
@@ -143,15 +139,21 @@ window.__GOOFY = {
     let contentObserver = null;
     let removalObserver = null;
     let disposed = false;
+    let retryTimer = null;
     const self = this;
 
     const handle = {
       disconnect: function () {
         disposed = true;
+        if (retryTimer) clearTimeout(retryTimer);
         contentObserver?.disconnect();
         removalObserver?.disconnect();
       },
       pause: function () {
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          retryTimer = null;
+        }
         contentObserver?.disconnect();
         removalObserver?.disconnect();
       },
@@ -165,7 +167,7 @@ window.__GOOFY = {
       const element = document.querySelector(selector);
       if (!element) {
         self.log(`observe(${selector}): not found, retrying`);
-        setTimeout(setup, retryInterval);
+        retryTimer = setTimeout(setup, retryInterval);
         return;
       }
 
@@ -178,20 +180,22 @@ window.__GOOFY = {
       });
       contentObserver.observe(element, { subtree, childList, characterData });
 
+      // Scope removal watch to the parent only — never document.body subtree
+      // (that was a major CPU hotspot on Messenger's busy DOM).
       removalObserver?.disconnect();
-      removalObserver = new MutationObserver(() => {
-        if (!document.contains(element)) {
-          self.log(`observe(${selector}): removed, re-attaching`);
-          contentObserver?.disconnect();
-          removalObserver?.disconnect();
-          if (onRemove) onRemove();
-          setup();
-        }
-      });
-      removalObserver.observe(document.body, {
-        childList: true,
-        subtree: true,
-      });
+      const parent = element.parentNode;
+      if (parent) {
+        removalObserver = new MutationObserver(() => {
+          if (!document.contains(element)) {
+            self.log(`observe(${selector}): removed, re-attaching`);
+            contentObserver?.disconnect();
+            removalObserver?.disconnect();
+            if (onRemove) onRemove();
+            setup();
+          }
+        });
+        removalObserver.observe(parent, { childList: true, subtree: false });
+      }
     };
 
     setup();
@@ -207,15 +211,23 @@ window.__GOOFY = {
 
     if (next === "background") {
       this._observersPaused = true;
+      // Clear pending debounces so background catch-up doesn't fire from stale work
+      Object.keys(this._debounceTimers).forEach((k) => {
+        clearTimeout(this._debounceTimers[k]);
+        delete this._debounceTimers[k];
+      });
       this._activeObservers.forEach((o) => o.pause && o.pause());
     } else {
       this._observersPaused = false;
       this._activeObservers.forEach((o) => o.resume && o.resume());
-      // Catch up once after resume
-      this.debounce("messages", () => {
-        this.checkForNewMessages();
-        this.updateBadgeCount();
-      }, 100);
+      this.debounce(
+        "messages",
+        () => {
+          this.checkForNewMessages();
+          this.updateBadgeCount();
+        },
+        200,
+      );
     }
   },
 
@@ -236,14 +248,15 @@ window.__GOOFY = {
       );
     }
 
-    // Fallback: count unread via isUnreadThread
     let count = unreadDots.length;
     if (count === 0) {
+      // Cheap fallback — no getComputedStyle
       count = this.getThreadLinks().filter((a) => this.isUnreadThread(a)).length;
     }
 
+    if (count === this._lastBadgeCount) return;
+    this._lastBadgeCount = count;
     this.postToNative({ type: "badge", count });
-    this.log(`Badge count: ${count}`);
   },
 
   // --- Current thread ---
@@ -251,18 +264,25 @@ window.__GOOFY = {
   getCurrentThreadKey: function () {
     try {
       const path = window.location.pathname || "";
-      // /messages/t/<id>/ or /messages/e/<id>/
       const match = path.match(/\/messages\/(?:t|e)\/([^/]+)/);
       if (match) {
         return window.location.pathname + (window.location.search || "");
       }
-      // Selected row
       const selected =
         document.querySelector('[role="navigation"] [role="row"][aria-selected="true"] a') ||
         document.querySelector('[role="navigation"] a[aria-current="page"]');
       if (selected) return selected.getAttribute("href");
     } catch (_) {}
     return null;
+  },
+
+  publishCurrentThread: function (currentKey) {
+    if (currentKey === this._lastCurrentThreadKey) return;
+    this._lastCurrentThreadKey = currentKey;
+    this.postToNative({
+      type: "currentThread",
+      threadKey: currentKey,
+    });
   },
 
   // --- New message detection ---
@@ -326,11 +346,7 @@ window.__GOOFY = {
       }
     });
 
-    // Always publish current thread for native suppression logic
-    this.postToNative({
-      type: "currentThread",
-      threadKey: currentKey,
-    });
+    this.publishCurrentThread(currentKey);
   },
 
   // --- Actions called from Swift ---
@@ -348,7 +364,6 @@ window.__GOOFY = {
     const links = this.getThreadLinks();
     if (index >= 0 && index < links.length) {
       links[index].click();
-      this.log(`jumpToThread(${index})`);
     }
   },
 
@@ -358,7 +373,6 @@ window.__GOOFY = {
     const current = this.getCurrentThreadKey();
     let idx = links.findIndex((a) => a.getAttribute("href") === current);
     if (idx < 0) {
-      // Match by path prefix
       const path = window.location.pathname;
       idx = links.findIndex((a) => {
         const href = a.getAttribute("href") || "";
@@ -367,7 +381,6 @@ window.__GOOFY = {
     }
     const next = idx <= 0 ? links.length - 1 : idx - 1;
     links[next].click();
-    this.log(`prevThread -> ${next}`);
   },
 
   nextThread: function () {
@@ -384,7 +397,6 @@ window.__GOOFY = {
     }
     const next = idx < 0 || idx >= links.length - 1 ? 0 : idx + 1;
     links[next].click();
-    this.log(`nextThread -> ${next}`);
   },
 
   newMessage: function () {
@@ -406,41 +418,6 @@ window.__GOOFY = {
     }
   },
 
-  setChatOnly: function (enabled) {
-    document.documentElement.classList.toggle("goofy-chat-only", !!enabled);
-  },
-
-  // Optional privacy stubs — only active when prefs are on (injected from Swift too)
-  applyPrivacyHooks: function (blockTyping, blockSeen) {
-    if (!blockTyping && !blockSeen) return;
-    try {
-      const originalFetch = window.fetch;
-      if (originalFetch && !window.__GOOFY_PRIVACY_FETCH__) {
-        window.__GOOFY_PRIVACY_FETCH__ = true;
-        const self = this;
-        window.fetch = function () {
-          try {
-            const arg = arguments[0];
-            const url = typeof arg === "string" ? arg : arg && arg.url;
-            if (typeof url === "string") {
-              if (blockTyping && /typ|typing|comet_typing/i.test(url)) {
-                self.log("Blocked typing request (fetch)");
-                return Promise.resolve(new Response("{}", { status: 200 }));
-              }
-              if (blockSeen && /mark_seen|delivery_receipt|read_receipt|seen/i.test(url)) {
-                self.log("Blocked seen request (fetch)");
-                return Promise.resolve(new Response("{}", { status: 200 }));
-              }
-            }
-          } catch (_) {}
-          return originalFetch.apply(this, arguments);
-        };
-      }
-    } catch (e) {
-      this.log("applyPrivacyHooks error: " + e);
-    }
-  },
-
   // --- Init ---
 
   init: function () {
@@ -455,16 +432,28 @@ window.__GOOFY = {
             this.checkForNewMessages();
             this.updateBadgeCount();
           },
-          350,
+          this.debounceMs(),
         );
       },
       {
         onSetup: () => this.updateBadgeCount(),
         onRemove: () => {
           this.threadSnapshots = null;
+          this._lastBadgeCount = -1;
         },
       },
     );
+
+    // Pause when the page is hidden (window ordered out / tab-like hide)
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        this.setAppState("background");
+      } else if (this.appState === "background") {
+        // Native will also send foreground when app becomes active;
+        // only resume here if we were paused solely by visibility.
+        this.setAppState("foreground");
+      }
+    });
   },
 };
 
