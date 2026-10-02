@@ -32,11 +32,7 @@ class SafariLoginController: NSObject, WKNavigationDelegate, WKUIDelegate {
         webView.uiDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
 
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
-        let osVersionString =
-            "\(osVersion.majorVersion)_\(osVersion.minorVersion)_\(osVersion.patchVersion)"
-        webView.customUserAgent =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X \(osVersionString)) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        webView.customUserAgent = ViewController.safariUserAgent()
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 700),
