@@ -4,7 +4,30 @@ window.__GOOFY = {
     "❤": "❤️",
   },
 
-  IGNORED_SNIPPET_PREFIXES: ["You sent an attachment.", "You: "],
+  // Own-message snippet prefixes across Messenger locales (#519).
+  // Prefer startsWith on these; isOwnSnippet also matches a loose regex.
+  IGNORED_SNIPPET_PREFIXES: [
+    "You sent an attachment.",
+    "You: ",
+    "Ty: ",           // Polish
+    "Bạn: ",          // Vietnamese
+    "Du: ",           // German informal
+    "Sie: ",          // German formal
+    "Tu: ",           // Italian / French informal / Spanish informal (also "Tú: ")
+    "Tú: ",           // Spanish
+    "Vous: ",         // French formal
+    "Vous avez ",     // French "You have/sent…"
+    "Ty wysłałeś",    // Polish you sent (masc)
+    "Ty wysłałaś",    // Polish you sent (fem)
+    "Bạn đã gửi",     // Vietnamese you sent
+    "Du hast",        // German you have/sent
+    "You sent ",
+    "You replied ",
+    "You reacted ",
+  ],
+
+  // Locale-agnostic own-snippet detector (prefix list + regex).
+  OWN_SNIPPET_REGEX: /^(you(\s+(sent|replied|reacted))?|ty|bạn|du|sie|tu|tú|vous)([:\s]|$)/i,
 
   threadSnapshots: null,
   appState: "foreground",
@@ -380,10 +403,7 @@ window.__GOOFY = {
 
       if (shouldNotify) {
         threadName = this.getThreadName(a);
-        const hasIgnoredPrefix = this.IGNORED_SNIPPET_PREFIXES.some((prefix) =>
-          (snippet || "").startsWith(prefix),
-        );
-        if (!hasIgnoredPrefix) {
+        if (!this.isOwnSnippet(snippet)) {
           this.postToNative({
             type: "notification",
             title: threadName || "Messenger",
@@ -476,6 +496,65 @@ window.__GOOFY = {
     }
   },
 
+  isOwnSnippet: function (snippet) {
+    const s = (snippet || "").trim();
+    if (!s) return false;
+    if (this.IGNORED_SNIPPET_PREFIXES.some((prefix) => s.startsWith(prefix))) {
+      return true;
+    }
+    try {
+      return this.OWN_SNIPPET_REGEX.test(s);
+    } catch (_) {
+      return false;
+    }
+  },
+
+  // Called from Swift on a native timer while the window is hidden (and
+  // suspendWhenHidden is OFF). The evaluateJavaScript call itself wakes WebKit;
+  // re-running the scan recovers badge/noti if observers stalled.
+  keepAlive: function () {
+    this.scheduleMessageCheck();
+    this.attachmentChecks && this.attachmentChecks();
+  },
+
+  // Optional light pass for in-flight attachment UI / decode (no-op-safe).
+  attachmentChecks: function () {
+    try {
+      this.decorateMediaLazy();
+    } catch (_) {}
+  },
+
+  // True when a real video or longer audio (voice note) is actively playing.
+  // Short notification pings must NOT count — they steal Now Playing (#521).
+  hasRealMediaPlaying: function () {
+    try {
+      const els = document.querySelectorAll("audio, video");
+      for (const el of els) {
+        if (el.paused || el.ended) continue;
+        if (el.tagName === "VIDEO" && (el.videoWidth > 0 || el.offsetWidth > 40)) {
+          return true;
+        }
+        const d = el.duration;
+        if (el.tagName === "AUDIO" && isFinite(d) && d > 5) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  },
+
+  // Clear page Media Session when idle (injected into page world from native too).
+  clearMediaSessionIfIdle: function () {
+    if (this.hasRealMediaPlaying()) return false;
+    try {
+      if (navigator.mediaSession) {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = "none";
+      }
+    } catch (_) {}
+    return true;
+  },
+
   scheduleMessageCheck: function () {
     this.debounce(
       "messages",
@@ -561,6 +640,37 @@ window.__GOOFY = {
 
     // One-shot media decorate after first paint (does not pause observers).
     requestAnimationFrame(() => this.decorateMediaLazy());
+
+    // #521: after short audio/video (noti pings), ask native to clear Now Playing.
+    document.addEventListener(
+      "play",
+      (e) => {
+        const el = e.target;
+        if (!el || (el.tagName !== "AUDIO" && el.tagName !== "VIDEO")) return;
+        const clearSoon = () => {
+          if (this.hasRealMediaPlaying()) return;
+          this.clearMediaSessionIfIdle();
+          this.postToNative({ type: "nowPlaying", state: "idle" });
+        };
+        // Voice/video: only clear when nothing real is left.
+        if (el.tagName === "VIDEO" && (el.videoWidth > 0 || el.offsetWidth > 40)) {
+          el.addEventListener("pause", clearSoon, { once: true });
+          el.addEventListener("ended", clearSoon, { once: true });
+          return;
+        }
+        const d = el.duration;
+        if (isFinite(d) && d > 5) {
+          el.addEventListener("pause", clearSoon, { once: true });
+          el.addEventListener("ended", clearSoon, { once: true });
+          return;
+        }
+        // Likely notification ping — clear after it finishes / short timeout.
+        el.addEventListener("ended", clearSoon, { once: true });
+        el.addEventListener("pause", clearSoon, { once: true });
+        setTimeout(clearSoon, 2200);
+      },
+      true,
+    );
   },
 };
 
