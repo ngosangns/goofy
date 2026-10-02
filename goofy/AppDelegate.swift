@@ -3,8 +3,8 @@
 //  goofy
 //
 //  Created by Daniel Büchele on 02/01/2026.
-//  Speed-trim: no global hotkeys, no Always-on-Top / Hide Dock / chat-only /
-//  typing-seen hooks. Menu bar opt-in (default off). AppUpdater delayed.
+//  Speed-trim-2: AppUpdater fully deferred; media prefs; auth cookie cache;
+//  reduced-motion CSS; cheaper JS notify path. Menu bar opt-in (default off).
 //
 
 import AppUpdater
@@ -23,6 +23,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var statusItem: NSStatusItem?
     private var updateCheckWorkItem: DispatchWorkItem?
+    private var updaterSubscribed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let window = NSApplication.shared.windows.first {
@@ -30,17 +31,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.setFrameAutosaveName("MainWindow")
         }
 
-        Self.appUpdater.$state
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in
-                if case .downloaded(let release, _, let bundle) = state {
-                    self?.showUpdateAlert(version: release.tagName.description, bundle: bundle)
-                }
-            }
-            .store(in: &cancellables)
-
-        // Delay auto-update network/CPU off the launch hot path.
-        let work = DispatchWorkItem {
+        // Delay AppUpdater subscription + network check off the launch hot path.
+        let work = DispatchWorkItem { [weak self] in
+            self?.ensureUpdaterSubscribed()
             Self.appUpdater.check()
         }
         updateCheckWorkItem = work
@@ -395,6 +388,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshCheckStates()
     }
 
+    /// Lazily subscribe so launch does not pay Combine/AppUpdater overhead.
+    private func ensureUpdaterSubscribed() {
+        guard !updaterSubscribed else { return }
+        updaterSubscribed = true
+        Self.appUpdater.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                if case .downloaded(let release, _, let bundle) = state {
+                    self?.showUpdateAlert(version: release.tagName.description, bundle: bundle)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     private func showUpdateAlert(version: String, bundle: Bundle) {
         let alert = NSAlert()
         alert.messageText = "Update Available"
@@ -418,6 +425,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @IBAction func checkForUpdates(_ sender: Any?) {
         updateCheckWorkItem?.cancel()
+        ensureUpdaterSubscribed()
         Self.appUpdater.check(
             success: {
                 DispatchQueue.main.async {

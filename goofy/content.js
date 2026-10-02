@@ -131,7 +131,7 @@ window.__GOOFY = {
       subtree = true,
       childList = true,
       characterData = false,
-      retryInterval = 5000,
+      retryInterval = 8000,
       onSetup = null,
       onRemove = null,
     } = options;
@@ -290,60 +290,66 @@ window.__GOOFY = {
   checkForNewMessages: function () {
     if (this.appState === "background") return;
 
-    const threads = this.getThreadLinks()
-      .map((a, index) => ({
-        threadKey: a.getAttribute("href"),
-        threadName: this.getThreadName(a),
-        snippet: this.getTextWithImageAlts(this.getSnippetElement(a)),
-        isUnread: this.isUnreadThread(a),
-        isMuted: this.isMutedThread(a),
-        position: index,
-      }))
-      .filter((t) => Boolean(t.threadKey));
-
+    const links = this.getThreadLinks();
     let firstRun = false;
-    if (threads.length > 0 && this.threadSnapshots == null) {
+    if (links.length > 0 && this.threadSnapshots == null) {
       this.threadSnapshots = new Map();
       firstRun = true;
     }
 
     const currentKey = this.getCurrentThreadKey();
 
-    threads.forEach((thread) => {
-      const prev = this.threadSnapshots.get(thread.threadKey);
-      this.threadSnapshots.set(thread.threadKey, thread);
+    links.forEach((a, index) => {
+      const threadKey = a.getAttribute("href");
+      if (!threadKey) return;
 
-      if (!thread.isUnread) return;
-      if (thread.isMuted) return;
+      // Cheap flags first — avoid snippet/name DOM walks for read/muted rows.
+      const isUnread = this.isUnreadThread(a);
+      const isMuted = this.isMutedThread(a);
+      const prev = this.threadSnapshots.get(threadKey);
+
+      let snippet = prev ? prev.snippet || "" : "";
+      let threadName = prev ? prev.threadName || null : null;
 
       let shouldNotify = false;
-
-      if (prev) {
-        if (!prev.isUnread) {
-          shouldNotify = true;
-        } else if (thread.snippet !== prev.snippet) {
-          shouldNotify = true;
-        }
-      } else {
-        if (thread.position === 0 && !firstRun) {
+      if (isUnread && !isMuted) {
+        // Only walk snippet DOM when unread+unmuted (notify candidates).
+        snippet = this.getTextWithImageAlts(this.getSnippetElement(a));
+        if (prev) {
+          if (!prev.isUnread) {
+            shouldNotify = true;
+          } else if (snippet !== prev.snippet) {
+            shouldNotify = true;
+          }
+        } else if (index === 0 && !firstRun) {
           shouldNotify = true;
         }
       }
 
       if (shouldNotify) {
+        threadName = this.getThreadName(a);
         const hasIgnoredPrefix = this.IGNORED_SNIPPET_PREFIXES.some((prefix) =>
-          (thread.snippet || "").startsWith(prefix),
+          (snippet || "").startsWith(prefix),
         );
-        if (hasIgnoredPrefix) return;
-
-        this.postToNative({
-          type: "notification",
-          title: thread.threadName || "Messenger",
-          body: thread.snippet || "",
-          threadKey: thread.threadKey,
-          currentThreadKey: currentKey,
-        });
+        if (!hasIgnoredPrefix) {
+          this.postToNative({
+            type: "notification",
+            title: threadName || "Messenger",
+            body: snippet || "",
+            threadKey,
+            currentThreadKey: currentKey,
+          });
+        }
       }
+
+      this.threadSnapshots.set(threadKey, {
+        threadKey,
+        threadName,
+        snippet,
+        isUnread,
+        isMuted,
+        position: index,
+      });
     });
 
     this.publishCurrentThread(currentKey);

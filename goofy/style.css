@@ -22,3 +22,16 @@ h1.html-h1 {
 [role="navigation"] header {
     justify-content: flex-end !important;
 }
+
+
+/* Respect system Reduce Motion — cuts Messenger transition/animation CPU when enabled. */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}

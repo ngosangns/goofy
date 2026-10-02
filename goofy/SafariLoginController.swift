@@ -27,9 +27,12 @@ class SafariLoginController: NSObject, WKNavigationDelegate, WKUIDelegate {
         #if DEBUG
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         #endif
+        configuration.mediaTypesRequiringUserActionForPlayback = .all
+        configuration.allowsAirPlayForMediaPlayback = false
 
         // Use the same Safari user agent
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.setValue(false, forKey: "drawsBackground")
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false

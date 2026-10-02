@@ -153,3 +153,26 @@ Goal: drop features that do not help speed; cut CPU/RAM/battery hotspots.
 | 6.10 | Drop `getComputedStyle` unread heuristic | Avoid forced layout |
 
 **Done when:** Release build installs; core login/webview/badge/links work; idle CPU lower than Phase 4.
+
+## Speed-trim-2 (post PR #3)
+
+### Implemented
+- Defer AppUpdater Combine subscribe + check (lazy; manual Check for Updates still works)
+- WKWebView: `mediaTypesRequiringUserActionForPlayback = .all`, AirPlay off
+- Skip `getAllCookies` after first successful auth
+- Wake soft-reload short-circuit when authenticated + not idle enough
+- Network monitor utility QoS; Release silences hot-path `print`
+- Defer notification authorization ~2s off cold launch
+- Cache Safari UA string
+- JS: only walk snippet/name DOM for unread+unmuted rows; observer retry 8s
+- CSS: `@media (prefers-reduced-motion: reduce)` animation/transition kill
+
+### Skipped (not safe / low confidence)
+- Content Blocker / fbcdn pixel blocking — media + stickers share hosts
+- Always-on animation kill (UX); empty toolbar removal (traffic lights)
+- Custom WKProcessPool (single webview; default fine)
+- Aggressive resource-load cancel via WKNavigationDelegate (breaks FB CDN)
+
+### Measure
+- Instruments Time Profiler + Allocations on idle 5 min; Activity Monitor CPU/Energy while scrolled + backgrounded
+
