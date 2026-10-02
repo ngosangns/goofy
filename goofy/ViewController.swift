@@ -92,6 +92,10 @@ class ViewController: NSViewController {
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         #endif
 
+        // Avoid autoplay / AirPlay background media work in a chat shell.
+        configuration.mediaTypesRequiringUserActionForPlayback = .all
+        configuration.allowsAirPlayForMediaPlayback = false
+
         let userContentController = WKUserContentController()
 
         // Use .defaultClient world to isolate our code from the page's JS
@@ -203,13 +207,17 @@ class ViewController: NSViewController {
 
     // MARK: - Safari UA
 
-    static func safariUserAgent() -> String {
+    private static let cachedSafariUserAgent: String = {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersion
         let osVersionString =
             "\(osVersion.majorVersion)_\(osVersion.minorVersion)_\(osVersion.patchVersion)"
         let safariVersion = safariShortVersion() ?? "17.0"
         return
             "Mozilla/5.0 (Macintosh; Intel Mac OS X \(osVersionString)) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
+    }()
+
+    static func safariUserAgent() -> String {
+        cachedSafariUserAgent
     }
 
     static func safariShortVersion() -> String? {
@@ -298,20 +306,33 @@ class ViewController: NSViewController {
                 self?.handleNetworkChange(path)
             }
         }
-        networkMonitor?.start(queue: DispatchQueue(label: "NetworkMonitor"))
+        networkMonitor?.start(
+            queue: DispatchQueue(label: "NetworkMonitor", qos: .utility))
     }
 
     private func timerFired() {
         if NSApplication.shared.isActive {
             reloadPending = true
+            #if DEBUG
             print("Reload deferred - app is in foreground")
+            #endif
         } else {
             softReload(reason: "periodic-timer")
         }
     }
 
     @objc private func systemDidWake(_ notification: Notification) {
+        // Skip wake storm when session looks healthy and user was recently active.
+        let idle = Date().timeIntervalSince(lastUserInteraction)
+        if isAuthenticated, idle < softReloadIdleSeconds, !isPageLikelyBroken() {
+            #if DEBUG
+            print("System wake - soft reload skipped (authenticated, idle \(Int(idle))s)")
+            #endif
+            return
+        }
+        #if DEBUG
         print("System woke from sleep - evaluating soft reload")
+        #endif
         softReload(reason: "wake")
     }
 
@@ -321,7 +342,9 @@ class ViewController: NSViewController {
             // Debounce NWPathMonitor chatter (flaps on sleep/VPN).
             networkReloadWorkItem?.cancel()
             let work = DispatchWorkItem { [weak self] in
+                #if DEBUG
                 print("Network connection restored - evaluating soft reload")
+                #endif
                 self?.softReload(reason: "network")
             }
             networkReloadWorkItem = work
@@ -338,7 +361,9 @@ class ViewController: NSViewController {
         let isKey = view.window?.isKeyWindow == true && NSApp.isActive
 
         if isKey && recentlyTyped {
+            #if DEBUG
             print("Soft reload skipped (\(reason)): user recently active while key")
+            #endif
             reloadPending = true
             return
         }
@@ -347,7 +372,9 @@ class ViewController: NSViewController {
         let sinceLast = Date().timeIntervalSince(lastReloadDate)
         let pageBroken = isPageLikelyBroken()
         if !pageBroken && sinceLast < 10 * 60 {
+            #if DEBUG
             print("Soft reload skipped (\(reason)): reloaded \(Int(sinceLast))s ago")
+            #endif
             reloadPending = true
             return
         }
@@ -357,9 +384,11 @@ class ViewController: NSViewController {
         if pageBroken || idleEnough {
             performReload(reason: reason)
         } else {
+            #if DEBUG
             print(
                 "Soft reload deferred (\(reason)): idle \(Int(idle))s < \(Int(softReloadIdleSeconds))s"
             )
+            #endif
             reloadPending = true
         }
     }
@@ -378,7 +407,9 @@ class ViewController: NSViewController {
         reloadPending = false
         lastReloadDate = Date()
         webView.reload()
+        #if DEBUG
         print("Reload performed (\(reason))")
+        #endif
     }
 
     @objc private func applicationDidResignActive(_ notification: Notification) {
@@ -503,12 +534,16 @@ class ViewController: NSViewController {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
 
-        // Request permission
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            if let error = error {
-                print("Notification authorization error: \(error)")
+        // Defer permission prompt/work slightly so it is not on the cold-launch path.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+                #if DEBUG
+                if let error = error {
+                    print("Notification authorization error: \(error)")
+                }
+                print("Notification permission granted: \(granted)")
+                #endif
             }
-            print("Notification permission granted: \(granted)")
         }
     }
 
@@ -751,21 +786,29 @@ extension ViewController: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let url = webView.url else { return }
+        #if DEBUG
         print("Page finished loading: \(url.absoluteString)")
+        #endif
 
         guard url.host?.contains("facebook.com") == true,
               safariLoginController == nil else { return }
 
-        // Check if the user is authenticated; if not, open Safari login
+        // Once authenticated, skip repeated getAllCookies scans on every navigation.
+        if isAuthenticated { return }
+
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
-            let authenticated = cookies.contains { $0.domain.contains("facebook.com") && $0.name == "c_user" }
+            let authenticated = cookies.contains {
+                $0.domain.contains("facebook.com") && $0.name == "c_user"
+            }
             DispatchQueue.main.async {
                 if authenticated {
                     self?.isAuthenticated = true
                     let foreground = NSApp.isActive && (self?.windowVisible ?? true)
                     self?.notifyAppState(foreground ? "foreground" : "background")
                 } else {
+                    #if DEBUG
                     print("[Goofy] Not authenticated, opening Safari login window")
+                    #endif
                     self?.loginWithSafari(nil)
                 }
             }
@@ -773,14 +816,18 @@ extension ViewController: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        #if DEBUG
         print("Navigation failed: \(error.localizedDescription)")
+        #endif
     }
 
     func webView(
         _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
+        #if DEBUG
         print("Provisional navigation failed: \(error.localizedDescription)")
+        #endif
     }
 }
 
